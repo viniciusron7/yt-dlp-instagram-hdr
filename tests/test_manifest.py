@@ -12,6 +12,7 @@ PLUGIN_SPEC = importlib.util.spec_from_file_location('instagram_hdr_under_test',
 PLUGIN_MODULE = importlib.util.module_from_spec(PLUGIN_SPEC)
 PLUGIN_SPEC.loader.exec_module(PLUGIN_MODULE)
 InstagramHDRIE = PLUGIN_MODULE.InstagramHDRIE
+InstagramHDRStoryIE = PLUGIN_MODULE.InstagramHDRStoryIE
 InstagramHDRVerifyPP = PLUGIN_MODULE.InstagramHDRVerifyPP
 _parse_manifest = PLUGIN_MODULE._parse_manifest
 
@@ -100,12 +101,20 @@ class ManifestTests(unittest.TestCase):
         video = next(track for track in tracks if track['kind'] == 'video')
         self.assertIsNone(video['hdr_kind'])
 
-    def test_reels_and_video_posts_are_captured(self):
+    def test_reels_posts_and_stories_are_captured(self):
         self.assertTrue(InstagramHDRIE.suitable('https://www.instagram.com/reel/ABC_123/'))
         self.assertTrue(InstagramHDRIE.suitable('https://www.instagram.com/user/reels/ABC-123/'))
         self.assertTrue(InstagramHDRIE.suitable('https://www.instagram.com/p/ABC_123/'))
         self.assertTrue(InstagramHDRIE.suitable('https://www.instagram.com/user/p/ABC_123/'))
         self.assertFalse(InstagramHDRIE.suitable('https://www.instagram.com/tv/ABC_123/'))
+        self.assertTrue(InstagramHDRStoryIE.suitable(
+            'https://www.instagram.com/stories/example/'))
+        self.assertTrue(InstagramHDRStoryIE.suitable(
+            'https://www.instagram.com/stories/example/1234567890/'))
+        self.assertTrue(InstagramHDRStoryIE.suitable(
+            'https://www.instagram.com/stories/highlights/1234567890/'))
+        self.assertFalse(InstagramHDRStoryIE.suitable(
+            'https://www.instagram.com/reel/ABC_123/'))
 
     def test_authentication_rejections_are_detected(self):
         class HTTPStatusError(Exception):
@@ -136,6 +145,78 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue(extractor._fallback_to_native)
         self.assertEqual(len(warnings), 1)
         self.assertIn('Falling back', warnings[0])
+
+    def test_story_missing_cookies_delegate_to_native_extractor(self):
+        extractor = InstagramHDRStoryIE()
+        extractor._fallback_to_native = True
+        result = extractor._real_extract('https://www.instagram.com/stories/example/')
+        self.assertEqual(result['_type'], 'url')
+        self.assertEqual(result['ie_key'], 'InstagramStory')
+        self.assertEqual(result['id'], 'example')
+
+    def test_story_fetches_media_info_and_returns_hdr_formats(self):
+        extractor = InstagramHDRStoryIE()
+        extractor.__dict__['_can_impersonate'] = False
+        extractor._get_cookies = lambda _url: {}
+        requests = []
+        extractor._download_json = lambda url, *_args, **_kwargs: (
+            requests.append(url) or {'items': [{
+                'pk': '123456789',
+                'video_duration': 12.5,
+                'video_dash_manifest': ladder_manifest(),
+            }]}
+        )
+        extractor.to_screen = lambda _message: None
+
+        result = extractor._extract_product_media({
+            'pk': '123456789',
+            'media_type': 2,
+            'video_versions': [{'url': 'https://cdn.example/fallback.mp4'}],
+        })
+
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(requests[0].endswith('/media/123456789/info/'))
+        self.assertTrue(result['__instagram_hdr'])
+        self.assertEqual(
+            [item['height'] for item in result['formats'] if item.get('vcodec') != 'none'],
+            [1280, 1920],
+        )
+
+    def test_story_without_hdr_keeps_sdr_formats(self):
+        extractor = InstagramHDRStoryIE()
+        extractor.__dict__['_can_impersonate'] = False
+        extractor._get_cookies = lambda _url: {}
+        extractor._download_json = lambda *_args, **_kwargs: {'items': [{
+            'pk': '123456789',
+            'media_type': 2,
+            'video_versions': [{
+                'id': 'sdr',
+                'url': 'https://cdn.example/sdr.mp4',
+                'width': 720,
+                'height': 1280,
+            }],
+        }]}
+
+        result = extractor._extract_product_media({
+            'pk': '123456789',
+            'media_type': 2,
+        })
+
+        self.assertNotIn('__instagram_hdr', result)
+        self.assertEqual(result['formats'][0]['format_id'], 'sdr')
+        self.assertEqual(result['formats'][0]['height'], 1280)
+
+    def test_image_story_does_not_request_media_info(self):
+        extractor = InstagramHDRStoryIE()
+        extractor._download_json = lambda *_args, **_kwargs: self.fail(
+            'Image stories must not request video info')
+
+        result = extractor._extract_product_media({
+            'pk': '123456789',
+            'media_type': 1,
+        })
+
+        self.assertEqual(result['formats'], [])
 
     def test_media_result_contains_sorted_video_and_audio_ladders(self):
         extractor = InstagramHDRIE()

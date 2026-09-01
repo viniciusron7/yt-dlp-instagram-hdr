@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from fractions import Fraction
 from typing import Any
 
-from yt_dlp.extractor.instagram import InstagramIE
+from yt_dlp.extractor.instagram import InstagramBaseIE, InstagramIE, InstagramStoryIE
 from yt_dlp.utils import (
     ExtractorError,
     encode_base_n,
@@ -259,21 +259,7 @@ def _audio_format(track: dict[str, Any], quality: int) -> dict[str, Any]:
     }
 
 
-class InstagramHDRIE(InstagramIE):
-    IE_NAME = 'instagram:hdr'
-    IE_DESC = 'Instagram videos and Reels HDR (authenticated iOS API)'
-    _VALID_URL = (
-        r'(?P<url>https?://(?:www\.)?instagram\.com'
-        r'(?:/(?!share/)[^/?#]+)?/(?:p|reels?)/(?P<id>[^/?#&]+))'
-    )
-    _TESTS = [{
-        'url': 'https://www.instagram.com/reel/Dcq5912OAjj/?igsh=example&foo=bar',
-        'only_matching': True,
-    }, {
-        'url': 'https://www.instagram.com/p/Dcq9fquOcko',
-        'only_matching': True,
-    }]
-
+class _InstagramHDRMixin:
     @property
     def _app_id(self):
         return self._APP_IDS['ios']
@@ -358,7 +344,9 @@ class InstagramHDRIE(InstagramIE):
 
     def _real_extract(self, url):
         if getattr(self, '_fallback_to_native', False):
-            return self.url_result(url, ie=InstagramIE, video_id=self._match_id(url))
+            match = self._match_valid_url(url)
+            video_id = match.groupdict().get('id') or match.groupdict().get('user')
+            return self.url_result(url, ie=self._NATIVE_IE, video_id=video_id)
         try:
             return super()._real_extract(url)
         except ExtractorError as error:
@@ -432,3 +420,55 @@ class InstagramHDRIE(InstagramIE):
             '_format_sort_fields': ('quality', 'res', 'br', 'fps'),
             '__instagram_hdr': True,
         }
+
+
+class InstagramHDRIE(_InstagramHDRMixin, InstagramIE):
+    IE_NAME = 'instagram:hdr'
+    IE_DESC = 'Instagram videos and Reels HDR (authenticated iOS API)'
+    _NATIVE_IE = InstagramIE
+    _VALID_URL = (
+        r'(?P<url>https?://(?:www\.)?instagram\.com'
+        r'(?:/(?!share/)[^/?#]+)?/(?:p|reels?)/(?P<id>[^/?#&]+))'
+    )
+    _TESTS = [{
+        'url': 'https://www.instagram.com/reel/Dcq5912OAjj/?igsh=example&foo=bar',
+        'only_matching': True,
+    }, {
+        'url': 'https://www.instagram.com/p/Dcq9fquOcko',
+        'only_matching': True,
+    }]
+
+
+class InstagramHDRStoryIE(_InstagramHDRMixin, InstagramStoryIE):
+    IE_NAME = 'instagram:story:hdr'
+    IE_DESC = 'Instagram Stories HDR (authenticated iOS API)'
+    _NATIVE_IE = InstagramStoryIE
+    _TESTS = [{
+        'url': 'https://www.instagram.com/stories/pablo_quero_leite/',
+        'only_matching': True,
+    }, {
+        'url': 'https://www.instagram.com/stories/pablo_quero_leite/1234567890/',
+        'only_matching': True,
+    }]
+
+    def _extract_product_media(self, product_media):
+        is_video = bool(
+            product_media.get('media_type') == 2
+            or product_media.get('video_versions')
+            or product_media.get('video_dash_manifest')
+        )
+        if not is_video:
+            return InstagramBaseIE._extract_product_media(self, product_media)
+
+        media_id = str(product_media.get('pk') or '')
+        detailed_media = traverse_obj(self._download_json(
+            f'{self._API_BASE_URL}/media/{media_id}/info/', media_id,
+            'Downloading HDR story info', 'HDR story info extraction failed',
+            impersonate=self._can_impersonate and self._is_web_app,
+            headers=self._api_headers), ('items', 0, {dict}))
+        try:
+            return super()._extract_product_media(detailed_media or product_media)
+        except ExtractorError as error:
+            if not error.expected:
+                raise
+            return InstagramBaseIE._extract_product_media(self, detailed_media or product_media)
