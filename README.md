@@ -16,37 +16,31 @@ Supports VP9 Profile 2 and AV1 10-bit HDR. Video and audio are downloaded by yt-
 ### pip
 
 ```shell
-python3 -m pip install -U \
-  https://github.com/viniciusron7/yt-dlp-instagram-hdr/archive/master.zip
+python3 -m pip install -U https://github.com/viniciusron7/yt-dlp-instagram-hdr/archive/master.zip
 ```
 
 ### pipx
 
 ```shell
-pipx inject yt-dlp \
-  https://github.com/viniciusron7/yt-dlp-instagram-hdr/archive/master.zip \
-  --force
+pipx inject yt-dlp https://github.com/viniciusron7/yt-dlp-instagram-hdr/archive/master.zip --force
 ```
 
 ## Usage
 
 ```shell
-yt-dlp --cookies-from-browser chrome \
-  "https://www.instagram.com/reel/SHORTCODE/"
+yt-dlp --cookies-from-browser chrome <video_url>
 ```
 
 List available formats with `-F`:
 
 ```shell
-yt-dlp --cookies-from-browser chrome -F \
-  "https://www.instagram.com/reel/SHORTCODE/"
+yt-dlp -F --cookies-from-browser chrome <video_url>
 ```
 
 You can also use a cookie file:
 
 ```shell
-yt-dlp --cookies cookies.txt \
-  "https://www.instagram.com/reel/SHORTCODE/"
+yt-dlp --cookies cookies.txt <video_url>
 ```
 
 Without authenticated cookies, the plugin shows a warning and falls back to yt-dlp's built-in Instagram extractor.
