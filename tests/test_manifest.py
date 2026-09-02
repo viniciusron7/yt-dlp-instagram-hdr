@@ -15,6 +15,7 @@ InstagramHDRIE = PLUGIN_MODULE.InstagramHDRIE
 InstagramHDRStoryIE = PLUGIN_MODULE.InstagramHDRStoryIE
 InstagramHDRVerifyPP = PLUGIN_MODULE.InstagramHDRVerifyPP
 _parse_manifest = PLUGIN_MODULE._parse_manifest
+_merge_native_audio_formats = PLUGIN_MODULE._merge_native_audio_formats
 
 
 def manifest(codec, tag, video_url='https://cdn.example/video.mp4?a=1&b=2'):
@@ -240,7 +241,7 @@ class ManifestTests(unittest.TestCase):
 
         self.assertEqual(result['formats'], [])
 
-    def test_media_result_contains_sorted_video_and_audio_ladders(self):
+    def test_media_result_contains_only_sorted_hdr_video_ladder(self):
         extractor = InstagramHDRIE()
         messages = []
         extractor.to_screen = messages.append
@@ -253,17 +254,50 @@ class ManifestTests(unittest.TestCase):
             item for item in result['formats']
             if item['format_id'].startswith('hdr-')
         ]
-        audios = [
-            item for item in result['formats']
-            if item['format_id'].startswith('audio-')
-        ]
         self.assertEqual([item['height'] for item in videos], [1280, 1920])
         self.assertEqual([item['fps'] for item in videos], [30, 60])
-        self.assertEqual([item['abr'] for item in audios], [64, 128])
+        self.assertFalse(any(item.get('vcodec') == 'none' for item in result['formats']))
         self.assertEqual(videos[-1]['dynamic_range'], 'HLG')
         self.assertEqual(result['duration'], 12.5)
         self.assertTrue(result['__instagram_hdr'])
         self.assertIn('1080x1920', messages[0])
+
+    def test_native_audio_replaces_manifest_audio_and_rejects_xhe_aac(self):
+        hdr = {
+            'id': 'ABC123',
+            '__instagram_hdr': True,
+            'formats': [{
+                'format_id': 'hdr-video',
+                'vcodec': 'vp9',
+                'acodec': 'none',
+            }, {
+                'format_id': 'plugin-xhe-audio',
+                'vcodec': 'none',
+                'acodec': 'mp4a.40.42',
+            }],
+        }
+        native = {
+            'id': 'ABC123',
+            'formats': [{
+                'format_id': 'native-video',
+                'vcodec': 'vp9',
+                'acodec': 'none',
+            }, {
+                'format_id': 'native-he-aac',
+                'vcodec': 'none',
+                'acodec': 'mp4a.40.5',
+            }, {
+                'format_id': 'native-xhe-aac',
+                'vcodec': 'none',
+                'acodec': 'mp4a.40.42',
+            }],
+        }
+
+        self.assertEqual(_merge_native_audio_formats(hdr, native), 1)
+        self.assertEqual(
+            [item['format_id'] for item in hdr['formats']],
+            ['hdr-video', 'native-he-aac'],
+        )
 
     def test_hdr_verifier_accepts_vp9_hlg(self):
         verifier = InstagramHDRVerifyPP()
@@ -304,6 +338,18 @@ class ManifestTests(unittest.TestCase):
                     '__instagram_hdr': True,
                     'filepath': output.name,
                 })
+
+    def test_hdr_verifier_skips_audio_only_downloads(self):
+        verifier = InstagramHDRVerifyPP()
+        verifier.get_metadata_object = lambda *_args, **_kwargs: self.fail(
+            'Audio-only downloads must not be HDR-verified')
+
+        deleted, info = verifier.run({
+            '__instagram_hdr': True,
+            'vcodec': 'none',
+        })
+        self.assertEqual(deleted, [])
+        self.assertEqual(info['vcodec'], 'none')
 
 
 if __name__ == '__main__':

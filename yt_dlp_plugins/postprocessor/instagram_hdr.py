@@ -13,6 +13,8 @@ class InstagramHDRVerifyPP(FFmpegPostProcessor):
     def run(self, info):
         if not info.get('__instagram_hdr'):
             return [], info
+        if info.get('vcodec') == 'none':
+            return [], info
 
         path = info.get('filepath')
         if not path or path == '-' or not os.path.isfile(path):

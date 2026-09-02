@@ -2,8 +2,10 @@
 
 A [yt-dlp](https://github.com/yt-dlp/yt-dlp) plugin that adds HDR formats for Instagram Reels, Stories, and video posts.
 
-Supports VP9 Profile 2 and AV1 10-bit HDR. Video and audio are downloaded by yt-dlp,
-merged without re-encoding, and verified with `ffprobe`.
+Supports VP9 Profile 2 and AV1 10-bit HDR. The plugin adds only the HDR video
+formats; compatible audio formats come from yt-dlp's built-in Instagram extractor.
+Video and audio are merged without re-encoding and the HDR video is verified with
+`ffprobe`.
 
 ## Requirements
 
