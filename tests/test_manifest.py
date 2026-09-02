@@ -186,6 +186,7 @@ class ManifestTests(unittest.TestCase):
         extractor = InstagramHDRStoryIE()
         extractor.__dict__['_can_impersonate'] = False
         extractor._get_cookies = lambda _url: {}
+        extractor.to_screen = lambda _message: None
         extractor._download_json = lambda *_args, **_kwargs: {'items': [{
             'pk': '123456789',
             'media_type': 2,
@@ -205,6 +206,27 @@ class ManifestTests(unittest.TestCase):
         self.assertNotIn('__instagram_hdr', result)
         self.assertEqual(result['formats'][0]['format_id'], 'sdr')
         self.assertEqual(result['formats'][0]['height'], 1280)
+
+    def test_post_without_hdr_keeps_native_formats(self):
+        extractor = InstagramHDRIE()
+        messages = []
+        extractor.to_screen = messages.append
+
+        result = extractor._extract_product_media({
+            'pk': '123456789',
+            'media_type': 2,
+            'video_versions': [{
+                'id': 'sdr',
+                'url': 'https://cdn.example/sdr.mp4',
+                'width': 720,
+                'height': 1280,
+            }],
+        })
+
+        self.assertNotIn('__instagram_hdr', result)
+        self.assertEqual(result['formats'][0]['format_id'], 'sdr')
+        self.assertEqual(result['formats'][0]['height'], 1280)
+        self.assertIn('built-in Instagram extractor', messages[0])
 
     def test_image_story_does_not_request_media_info(self):
         extractor = InstagramHDRStoryIE()

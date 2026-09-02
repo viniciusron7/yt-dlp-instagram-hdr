@@ -102,6 +102,7 @@ yt-dlp --cookies cookies.txt <video_url>
 ```
 
 Without authenticated cookies, the plugin shows a warning and falls back to yt-dlp's built-in Instagram extractor.
+It also uses the built-in extractor's regular formats when authenticated media has no HDR representation.
 
 ## License
 

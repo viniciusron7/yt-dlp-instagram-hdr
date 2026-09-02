@@ -381,10 +381,10 @@ class _InstagramHDRMixin:
             key=lambda track: track['bandwidth_int'],
         )
         if not videos:
-            raise ExtractorError(
-                'This Instagram video has no VP9/AV1 10-bit HDR representation in the iOS manifests',
-                expected=True,
-            )
+            self.to_screen(
+                'No VP9/AV1 10-bit HDR representation found; using formats from '
+                'yt-dlp\'s built-in Instagram extractor')
+            return InstagramBaseIE._extract_product_media(self, product_media)
         if not audios:
             raise ExtractorError(
                 'The HDR manifest contains no downloadable audio representation', expected=True)
