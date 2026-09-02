@@ -14,10 +14,61 @@ merged without re-encoding, and verified with `ffprobe`.
 
 ## Installation
 
+First, identify how yt-dlp was installed.
+
+**macOS**
+
+```shell
+command -v yt-dlp
+pipx list
+python3 -m pip show yt-dlp
+brew list --versions yt-dlp
+```
+
+**Linux**
+
+```shell
+command -v yt-dlp
+pipx list
+python3 -m pip show yt-dlp
+```
+
+**Windows (PowerShell)**
+
+```powershell
+Get-Command yt-dlp
+pipx list
+py -m pip show yt-dlp
+```
+
+Use the result that matches your output:
+
+| Output                                                       | Installation type |
+| ------------------------------------------------------------ | ----------------- |
+| `package yt-dlp ...` in `pipx list`                          | [pipx](#pipx)     |
+| `Name: yt-dlp` from `pip show`                               | [pip](#pip)       |
+| `yt-dlp <version>` from `brew list`                          | [manual](#manual) |
+| yt-dlp has a path, but the checks above report it as missing | [manual](#manual) |
+
+`Package(s) not found`, `nothing has been installed with pipx`, and `No such keg`
+are negative results; continue to the next check. If `command -v` or `Get-Command`
+cannot find yt-dlp, install yt-dlp first.
+
+If more than one check finds yt-dlp, use the manual method to avoid installing the
+plugin into the wrong Python environment.
+
 ### pip
+
+macOS/Linux:
 
 ```shell
 python3 -m pip install -U yt-dlp-instagram-hdr
+```
+
+Windows:
+
+```powershell
+py -m pip install -U yt-dlp-instagram-hdr
 ```
 
 ### pipx
@@ -25,6 +76,12 @@ python3 -m pip install -U yt-dlp-instagram-hdr
 ```shell
 pipx inject yt-dlp yt-dlp-instagram-hdr --force
 ```
+
+### Manual
+
+Download the latest `.whl` from [Releases](https://github.com/viniciusron7/yt-dlp-instagram-hdr/releases/latest), and place it, without extracting it, in:
+- macOS/Linux: `$XDG_CONFIG_HOME/yt-dlp/plugins/`, or `~/.config/yt-dlp/plugins/` when it is not set
+- Windows: `%APPDATA%/yt-dlp/plugins/`
 
 ## Usage
 
