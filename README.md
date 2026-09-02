@@ -17,13 +17,13 @@ merged without re-encoding, and verified with `ffprobe`.
 ### pip
 
 ```shell
-python3 -m pip install -U https://github.com/viniciusron7/yt-dlp-instagram-hdr/archive/refs/tags/v0.3.0.zip
+python3 -m pip install -U yt-dlp-instagram-hdr
 ```
 
 ### pipx
 
 ```shell
-pipx inject yt-dlp https://github.com/viniciusron7/yt-dlp-instagram-hdr/archive/refs/tags/v0.3.0.zip --force
+pipx inject yt-dlp yt-dlp-instagram-hdr --force
 ```
 
 ## Usage
