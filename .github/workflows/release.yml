@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Validate tag
+        if: github.ref_type == 'tag'
+        run: |
+          python - <<'PY'
+          import configparser
+          import os
+
+          config = configparser.ConfigParser()
+          config.read('setup.cfg')
+          version = config['metadata']['version']
+          tag = os.environ['GITHUB_REF_NAME']
+          if tag != f'v{version}':
+              raise SystemExit(f'Tag {tag!r} does not match package version {version!r}')
+          PY
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip build
+          python -m pip install .
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build wheel
+        run: python -m build --wheel
+
+      - name: Test built wheel
+        run: |
+          python -m pip install --force-reinstall dist/*.whl
+          cd "$RUNNER_TEMP"
+          python - <<'PY'
+          from yt_dlp.extractor import gen_extractor_classes
+          from yt_dlp.plugins import load_all_plugins
+          from yt_dlp.postprocessor import get_postprocessor
+
+          load_all_plugins()
+          extractors = {cls.__name__ for cls in gen_extractor_classes()}
+          expected = {'InstagramHDRIE', 'InstagramHDRStoryIE'}
+          assert expected <= extractors, expected - extractors
+          assert get_postprocessor('InstagramHDRVerify').__name__ == 'InstagramHDRVerifyPP'
+          PY
+
+      - name: Create GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.whl --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.whl \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: yt-dlp-instagram-hdr-wheel
+          path: dist/*.whl
+          if-no-files-found: error
