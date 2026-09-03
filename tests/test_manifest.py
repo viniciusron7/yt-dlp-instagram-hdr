@@ -3,6 +3,7 @@ import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from yt_dlp.utils import ExtractorError, PostProcessingError
 
@@ -15,7 +16,7 @@ InstagramHDRIE = PLUGIN_MODULE.InstagramHDRIE
 InstagramHDRStoryIE = PLUGIN_MODULE.InstagramHDRStoryIE
 InstagramHDRVerifyPP = PLUGIN_MODULE.InstagramHDRVerifyPP
 _parse_manifest = PLUGIN_MODULE._parse_manifest
-_merge_native_audio_formats = PLUGIN_MODULE._merge_native_audio_formats
+_merge_native_formats = PLUGIN_MODULE._merge_native_formats
 
 
 def manifest(codec, tag, video_url='https://cdn.example/video.mp4?a=1&b=2'):
@@ -262,7 +263,7 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue(result['__instagram_hdr'])
         self.assertIn('1080x1920', messages[0])
 
-    def test_native_audio_replaces_manifest_audio_and_rejects_xhe_aac(self):
+    def test_native_formats_are_merged_and_xhe_aac_is_rejected_by_default(self):
         hdr = {
             'id': 'ABC123',
             '__instagram_hdr': True,
@@ -293,11 +294,102 @@ class ManifestTests(unittest.TestCase):
             }],
         }
 
-        self.assertEqual(_merge_native_audio_formats(hdr, native), 1)
+        self.assertEqual(_merge_native_formats(hdr, native), 2)
         self.assertEqual(
             [item['format_id'] for item in hdr['formats']],
-            ['hdr-video', 'native-he-aac'],
+            ['hdr-video', 'native-video', 'native-he-aac'],
         )
+
+    def test_native_and_plugin_xhe_aac_are_included_when_enabled(self):
+        hdr = {
+            'id': 'ABC123',
+            '__instagram_hdr': True,
+            'formats': [{
+                'format_id': 'hdr-video',
+                'vcodec': 'vp9',
+                'acodec': 'none',
+            }, {
+                'format_id': 'plugin-xhe-audio',
+                'vcodec': 'none',
+                'acodec': 'mp4a.40.42',
+            }],
+        }
+        native = {
+            'id': 'ABC123',
+            'formats': [{
+                'format_id': 'native-xhe-audio',
+                'vcodec': 'none',
+                'acodec': 'mp4a.40.42',
+            }],
+        }
+
+        self.assertEqual(_merge_native_formats(hdr, native, include_xhe_aac=True), 1)
+        self.assertEqual(
+            [item['format_id'] for item in hdr['formats']],
+            ['hdr-video', 'plugin-xhe-audio', 'native-xhe-audio'],
+        )
+
+    def test_duplicate_native_format_ids_are_preserved_with_suffixes(self):
+        hdr = {
+            'id': 'ABC123',
+            '__instagram_hdr': True,
+            'formats': [{
+                'format_id': 'hdr-video',
+                'url': 'https://cdn.example/hdr.mp4',
+                'vcodec': 'vp9',
+                'acodec': 'none',
+            }],
+        }
+        native = {
+            'id': 'ABC123',
+            'formats': [{
+                'format_id': 'native-video',
+                'url': 'https://cdn.example/native-1.mp4',
+            }, {
+                'format_id': 'native-video',
+                'url': 'https://cdn.example/native-2.mp4',
+            }, {
+                'format_id': 'native-video',
+                'url': 'https://cdn.example/native-3.mp4',
+            }],
+        }
+
+        self.assertEqual(_merge_native_formats(hdr, native), 3)
+        self.assertEqual(
+            [item['format_id'] for item in hdr['formats']],
+            ['hdr-video', 'native-video-0', 'native-video-1', 'native-video-2'],
+        )
+
+    def test_include_xhe_aac_adds_manifest_audio_formats(self):
+        extractor = InstagramHDRIE()
+        extractor._downloader = SimpleNamespace(params={
+            'extractor_args': {'instagramhdr': {'include_xhe_aac': ['']}},
+        })
+        extractor.to_screen = lambda _message: None
+
+        result = extractor._extract_product_media({
+            'pk': '123456789',
+            'video_duration': 12.5,
+            'video_dash_manifest': ladder_manifest().replace(
+                'codecs="mp4a.40.2"', 'codecs="mp4a.40.42"'),
+        })
+
+        self.assertEqual(
+            [item['acodec'] for item in result['formats'] if item.get('vcodec') == 'none'],
+            ['mp4a.40.42', 'mp4a.40.42'],
+        )
+
+    def test_disable_uses_native_extractor_for_posts_and_stories(self):
+        downloader = SimpleNamespace(params={
+            'extractor_args': {'instagramhdr': {'disable': ['']}},
+        })
+        for extractor in (InstagramHDRIE(), InstagramHDRStoryIE()):
+            messages = []
+            extractor._downloader = downloader
+            extractor.to_screen = messages.append
+            extractor._real_initialize()
+            self.assertTrue(extractor._fallback_to_native)
+            self.assertIn('plugin disabled', messages[0])
 
     def test_hdr_verifier_accepts_vp9_hlg(self):
         verifier = InstagramHDRVerifyPP()

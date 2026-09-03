@@ -173,15 +173,19 @@ def _parse_manifest(manifest: str) -> list[dict[str, Any]]:
 
             mime_type = attrs.get('mimeType', '').lower()
             content_type = attrs.get('contentType', '').lower()
-            if not (mime_type.startswith('video/') or content_type == 'video'):
+            if mime_type.startswith('video/') or content_type == 'video':
+                kind = 'video'
+            elif mime_type.startswith('audio/') or content_type == 'audio':
+                kind = 'audio'
+            else:
                 continue
 
             rep_context = f'{adaptation_context} {match.group("attrs")}'
             tracks.append({
                 **attrs,
-                'kind': 'video',
+                'kind': kind,
                 'url': _decode_base_url(base_url.group('url')),
-                'hdr_kind': _hdr_kind(attrs, rep_context),
+                'hdr_kind': _hdr_kind(attrs, rep_context) if kind == 'video' else None,
                 'width_int': _int_value(attrs.get('width')),
                 'height_int': _int_value(attrs.get('height')),
                 'bandwidth_int': _int_value(attrs.get('bandwidth')),
@@ -235,22 +239,62 @@ def _video_format(track: dict[str, Any], quality: int) -> dict[str, Any]:
     }
 
 
+def _audio_format(track: dict[str, Any], quality: int) -> dict[str, Any]:
+    bitrate = _int_value(track.get('FBAvgBitrate')) or track['bandwidth_int']
+    return {
+        'url': track['url'],
+        'format_id': _format_id('audio', track),
+        'format_note': 'DASH audio, xHE-AAC',
+        'ext': 'mp4',
+        'abr': float_or_none(bitrate, 1000),
+        'tbr': float_or_none(track['bandwidth_int'], 1000),
+        'asr': int_or_none(track.get('audioSamplingRate')),
+        'filesize': int_or_none(track.get('FBContentLength')),
+        'quality': quality,
+        'http_headers': {
+            'User-Agent': _IOS_USER_AGENT,
+            'Referer': 'https://www.instagram.com/',
+        },
+        **parse_codecs(track.get('codecs', '')),
+    }
+
+
 def _media_entries(info: dict[str, Any]) -> list[dict[str, Any]]:
     if info.get('_type') == 'playlist':
         return [entry for entry in info.get('entries') or [] if isinstance(entry, dict)]
     return [info]
 
 
-def _native_audio_formats(info: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        dict(fmt) for fmt in info.get('formats') or []
-        if fmt.get('vcodec') == 'none'
-        and fmt.get('acodec') not in {None, 'none', 'mp4a.40.42'}
-    ]
+def _is_xhe_aac(fmt: dict[str, Any]) -> bool:
+    return str(fmt.get('acodec') or '').lower() == 'mp4a.40.42'
 
 
-def _merge_native_audio_formats(
-        hdr_info: dict[str, Any], native_info: dict[str, Any]) -> int:
+def _filter_xhe_aac(info: dict[str, Any]) -> None:
+    for entry in _media_entries(info):
+        entry['formats'] = [
+            fmt for fmt in entry.get('formats') or [] if not _is_xhe_aac(fmt)
+        ]
+
+
+def _disambiguate_format_ids(formats: list[dict[str, Any]]) -> None:
+    counts = {}
+    for fmt in formats:
+        format_id = fmt.get('format_id')
+        counts[format_id] = counts.get(format_id, 0) + 1
+
+    indexes = {}
+    for fmt in formats:
+        format_id = fmt.get('format_id')
+        if format_id is None or counts[format_id] < 2:
+            continue
+        index = indexes.get(format_id, 0)
+        fmt['format_id'] = f'{format_id}-{index}'
+        indexes[format_id] = index + 1
+
+
+def _merge_native_formats(
+        hdr_info: dict[str, Any], native_info: dict[str, Any],
+        include_xhe_aac: bool = False) -> int:
     hdr_entries = _media_entries(hdr_info)
     native_entries = _media_entries(native_info)
     native_by_id = {
@@ -268,13 +312,26 @@ def _merge_native_audio_formats(
         if native_entry is None:
             continue
 
-        audio_formats = _native_audio_formats(native_entry)
-        hdr_entry['formats'] = [
-            fmt for fmt in hdr_entry.get('formats') or []
-            if fmt.get('vcodec') != 'none'
+        if not include_xhe_aac:
+            hdr_entry['formats'] = [
+                fmt for fmt in hdr_entry.get('formats') or [] if not _is_xhe_aac(fmt)
+            ]
+        native_formats = [
+            dict(fmt) for fmt in native_entry.get('formats') or []
+            if include_xhe_aac or not _is_xhe_aac(fmt)
         ]
-        hdr_entry['formats'].extend(audio_formats)
-        added += len(audio_formats)
+        _disambiguate_format_ids(native_formats)
+        existing = {
+            (fmt.get('format_id'), fmt.get('url'))
+            for fmt in hdr_entry.get('formats') or []
+        }
+        for fmt in native_formats:
+            identity = (fmt.get('format_id'), fmt.get('url'))
+            if identity in existing:
+                continue
+            hdr_entry.setdefault('formats', []).append(fmt)
+            existing.add(identity)
+            added += 1
 
     return added
 
@@ -341,11 +398,30 @@ class _InstagramHDRMixin:
     def _is_auth_rejection(error: ExtractorError) -> bool:
         return getattr(error.cause, 'status', None) in {401, 403}
 
+    def _plugin_configuration_arg(self, key):
+        if not self._downloader:
+            return []
+        values = self._configuration_arg(key, ie_key=self.ie_key())
+        if values or self.ie_key() == 'InstagramHDR':
+            return values
+        return self._configuration_arg(key, ie_key='InstagramHDR')
+
+    def _plugin_flag(self, key, default=False):
+        values = self._plugin_configuration_arg(key)
+        if not values:
+            return default
+        return values[-1] not in {'0', 'false', 'no', 'off'}
+
     def _verification_enabled(self):
-        values = self._configuration_arg('verify', ['true'], ie_key=self.ie_key())
-        return values[0] not in {'0', 'false', 'no', 'off'}
+        return self._plugin_flag('verify', default=True)
 
     def _real_initialize(self):
+        if self._plugin_flag('disable'):
+            self._fallback_to_native = True
+            self.to_screen(
+                'Instagram HDR plugin disabled; using yt-dlp\'s built-in extractor')
+            return
+
         cookies = self._get_cookies('https://i.instagram.com/')
         if not cookies.get('sessionid') or not cookies.get('ds_user_id'):
             self._fallback_to_native = True
@@ -378,23 +454,26 @@ class _InstagramHDRMixin:
                 expected=True,
             ) from error
 
-        if not any(entry.get('__instagram_hdr') for entry in _media_entries(result)):
-            return result
-
-        self.to_screen('Loading audio formats with yt-dlp\'s built-in Instagram extractor')
+        include_xhe_aac = self._plugin_flag('include_xhe_aac')
+        self.to_screen('Loading all formats with yt-dlp\'s built-in Instagram extractor')
         try:
             native_result = self._NATIVE_IE(self._downloader).extract(url)
         except ExtractorError as error:
             self.report_warning(
-                f'Built-in Instagram extractor could not load audio formats: {error}')
+                f'Built-in Instagram extractor could not load formats: {error}')
             return result
 
-        added = _merge_native_audio_formats(result, native_result)
+        if not include_xhe_aac:
+            _filter_xhe_aac(native_result)
+
+        if not any(entry.get('__instagram_hdr') for entry in _media_entries(result)):
+            return native_result
+
+        added = _merge_native_formats(result, native_result, include_xhe_aac)
         if added:
-            self.to_screen(f'Added {added} compatible audio format(s) from yt-dlp')
+            self.to_screen(f'Added {added} native format(s) from yt-dlp')
         else:
-            self.report_warning(
-                'yt-dlp\'s built-in Instagram extractor returned no compatible audio formats')
+            self.report_warning('yt-dlp\'s built-in Instagram extractor returned no new formats')
         return result
 
     def _extract_product_media(self, product_media):
@@ -415,6 +494,12 @@ class _InstagramHDRMixin:
                 track['frame_rate_float'],
             ),
         )
+        xhe_audios = sorted(
+            (track for track in unique_tracks
+             if track['kind'] == 'audio'
+             and parse_codecs(track.get('codecs', '')).get('acodec') == 'mp4a.40.42'),
+            key=lambda track: track['bandwidth_int'],
+        )
         if not videos:
             self.to_screen(
                 'No VP9/AV1 10-bit HDR representation found; using formats from '
@@ -422,9 +507,13 @@ class _InstagramHDRMixin:
             return InstagramBaseIE._extract_product_media(self, product_media)
 
         best_video = videos[-1]
-        self.to_screen(
+        include_xhe_aac = self._plugin_flag('include_xhe_aac')
+        message = (
             f'Selected HDR ladder: up to {best_video["width_int"]}x{best_video["height_int"]}, '
             f'{best_video["frame_rate_float"]:g} fps, {best_video["hdr_kind"]}')
+        if include_xhe_aac:
+            message += f'; {len(xhe_audios)} xHE-AAC audio format(s) enabled'
+        self.to_screen(message)
 
         media_id = traverse_obj(product_media, ('pk', {str}))
         if not media_id:
@@ -436,6 +525,9 @@ class _InstagramHDRMixin:
             'id': shortcode,
             'formats': [
                 *(_video_format(track, quality) for quality, track in enumerate(videos)),
+                *((_audio_format(track, quality)
+                   for quality, track in enumerate(xhe_audios))
+                  if include_xhe_aac else ()),
             ],
             'duration': traverse_obj(product_media, ('video_duration', {float_or_none})),
             'thumbnails': list(reversed(traverse_obj(product_media, (

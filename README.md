@@ -2,8 +2,9 @@
 
 A [yt-dlp](https://github.com/yt-dlp/yt-dlp) plugin that adds HDR formats for Instagram Reels, Stories, and video posts.
 
-Supports VP9 Profile 2 and AV1 10-bit HDR. The plugin adds only the HDR video
-formats; compatible audio formats come from yt-dlp's built-in Instagram extractor.
+Supports VP9 Profile 2 and AV1 10-bit HDR. By default, the format list combines
+all HDR video formats found by the plugin with all formats returned by yt-dlp's
+built-in Instagram extractor. xHE-AAC is excluded unless explicitly enabled.
 Video and audio are merged without re-encoding and the HDR video is verified with
 `ffprobe`.
 
@@ -105,6 +106,23 @@ yt-dlp --cookies cookies.txt <video_url>
 
 Without authenticated cookies, the plugin shows a warning and falls back to yt-dlp's built-in Instagram extractor.
 It also uses the built-in extractor's regular formats when authenticated media has no HDR representation.
+
+### Plugin options
+
+Disable the HDR plugin and force yt-dlp's built-in Instagram extractor:
+
+```shell
+yt-dlp --extractor-args "instagramhdr:disable" <video_url>
+```
+
+Include the xHE-AAC (`mp4a.40.42`) audio formats found in the HDR manifest:
+
+```shell
+yt-dlp --extractor-args "instagramhdr:include_xhe_aac" -F <video_url>
+```
+
+These `instagramhdr` options apply to Reels, posts, and Stories. Boolean values
+can be disabled explicitly, for example `instagramhdr:disable=false`.
 
 ## License
 
