@@ -66,6 +66,7 @@ jobs:
           expected = {'InstagramHDRIE', 'InstagramHDRStoryIE'}
           assert expected <= extractors, expected - extractors
           assert get_postprocessor('InstagramHDRVerify').__name__ == 'InstagramHDRVerifyPP'
+          assert get_postprocessor('InstagramHDRHEVC').__name__ == 'InstagramHDRHEVCPP'
           PY
 
       - name: Upload workflow artifact

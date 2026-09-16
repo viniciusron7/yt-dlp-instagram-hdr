@@ -13,13 +13,14 @@ from yt_dlp.extractor.instagram import InstagramBaseIE, InstagramIE, InstagramSt
 from yt_dlp.utils import (
     ExtractorError,
     encode_base_n,
+    fix_xml_ampersands,
     float_or_none,
     int_or_none,
     parse_codecs,
     traverse_obj,
     url_or_none,
 )
-from yt_dlp_plugins.postprocessor.instagram_hdr import InstagramHDRVerifyPP
+from yt_dlp_plugins.postprocessor.instagram_hdr import InstagramHDRHEVCPP, InstagramHDRVerifyPP
 
 
 _SHORTCODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
@@ -180,7 +181,9 @@ def _parse_manifest(manifest: str) -> list[dict[str, Any]]:
             else:
                 continue
 
-            rep_context = f'{adaptation_context} {match.group("attrs")}'
+            rep_context = (
+                f'{adaptation_context} {match.group("attrs")} '
+                f'{_BASE_URL_RE.sub("", match.group("body"))}')
             tracks.append({
                 **attrs,
                 'kind': kind,
@@ -293,47 +296,34 @@ def _disambiguate_format_ids(formats: list[dict[str, Any]]) -> None:
 
 
 def _merge_native_formats(
-        hdr_info: dict[str, Any], native_info: dict[str, Any],
-        include_xhe_aac: bool = False) -> int:
-    hdr_entries = _media_entries(hdr_info)
-    native_entries = _media_entries(native_info)
+        info: dict[str, Any], native_info: dict[str, Any],
+        include_xhe_aac: bool = False) -> list[str]:
+    # Every item gets the native formats plus what only the iOS API has (HDR video,
+    # xHE-AAC). Returns the ids of items missing from the native result.
     native_by_id = {
-        str(entry['id']): entry for entry in native_entries if entry.get('id') is not None
+        str(entry['id']): entry
+        for entry in _media_entries(native_info) if entry.get('id') is not None
     }
-    added = 0
+    missing = []
 
-    for index, hdr_entry in enumerate(hdr_entries):
-        if not hdr_entry.get('__instagram_hdr'):
-            continue
-
-        native_entry = native_by_id.get(str(hdr_entry.get('id')))
-        if native_entry is None and len(hdr_entries) == len(native_entries):
-            native_entry = native_entries[index]
+    for entry in _media_entries(info):
+        # Pair by id only: the two requests may list different carousel or story items
+        native_entry = native_by_id.get(str(entry.get('id')))
         if native_entry is None:
+            missing.append(str(entry.get('id')))
             continue
 
-        if not include_xhe_aac:
-            hdr_entry['formats'] = [
-                fmt for fmt in hdr_entry.get('formats') or [] if not _is_xhe_aac(fmt)
-            ]
-        native_formats = [
-            dict(fmt) for fmt in native_entry.get('formats') or []
-            if include_xhe_aac or not _is_xhe_aac(fmt)
-        ]
+        native_formats = [dict(fmt) for fmt in native_entry.get('formats') or []]
         _disambiguate_format_ids(native_formats)
-        existing = {
-            (fmt.get('format_id'), fmt.get('url'))
-            for fmt in hdr_entry.get('formats') or []
-        }
-        for fmt in native_formats:
-            identity = (fmt.get('format_id'), fmt.get('url'))
-            if identity in existing:
-                continue
-            hdr_entry.setdefault('formats', []).append(fmt)
-            existing.add(identity)
-            added += 1
+        entry['formats'] = [
+            *(fmt for fmt in entry.get('formats') or []
+              if str(fmt.get('format_id')).startswith('hdr-') or _is_xhe_aac(fmt)),
+            *native_formats,
+        ]
 
-    return added
+    if not include_xhe_aac:
+        _filter_xhe_aac(info)
+    return missing
 
 
 class _InstagramHDRMixin:
@@ -372,8 +362,8 @@ class _InstagramHDRMixin:
             'x-ig-connection-type': 'WiFi',
             'x-ig-device-locale': 'en-US',
             'x-ig-mapped-locale': 'en-US',
-            'x-ig-timezone-offset': str(
-                (datetime.now().astimezone().utcoffset() or timedelta()).seconds),
+            'x-ig-timezone-offset': str(int(
+                (datetime.now().astimezone().utcoffset() or timedelta()).total_seconds())),
             'x-ig-www-claim': '0',
             'x-pigeon-rawclienttime': f'{time.time():.6f}',
             'x-pigeon-session-id': str(uuid.uuid4()),
@@ -431,8 +421,10 @@ class _InstagramHDRMixin:
                 'Pass --cookies-from-browser BROWSER or --cookies FILE to enable HDR.',
             )
             return
-        if self._verification_enabled() and not getattr(
-                self._downloader, '_instagram_hdr_verifier_registered', False):
+        if not getattr(self._downloader, '_instagram_hdr_verifier_registered', False):
+            # One registration serves every URL; each item carries its own options
+            self._downloader.add_post_processor(
+                InstagramHDRHEVCPP(self._downloader), when='post_process')
             self._downloader.add_post_processor(
                 InstagramHDRVerifyPP(self._downloader), when='after_move')
             self._downloader._instagram_hdr_verifier_registered = True
@@ -454,26 +446,20 @@ class _InstagramHDRMixin:
                 expected=True,
             ) from error
 
-        include_xhe_aac = self._plugin_flag('include_xhe_aac')
         self.to_screen('Loading all formats with yt-dlp\'s built-in Instagram extractor')
         try:
-            native_result = self._NATIVE_IE(self._downloader).extract(url)
+            native_result = self._NATIVE_IE(self._downloader).extract(url) or {}
         except ExtractorError as error:
             self.report_warning(
                 f'Built-in Instagram extractor could not load formats: {error}')
-            return result
+            native_result = {}
 
-        if not include_xhe_aac:
-            _filter_xhe_aac(native_result)
-
-        if not any(entry.get('__instagram_hdr') for entry in _media_entries(result)):
-            return native_result
-
-        added = _merge_native_formats(result, native_result, include_xhe_aac)
-        if added:
-            self.to_screen(f'Added {added} native format(s) from yt-dlp')
-        else:
-            self.report_warning('yt-dlp\'s built-in Instagram extractor returned no new formats')
+        missing = _merge_native_formats(
+            result, native_result, self._plugin_flag('include_xhe_aac'))
+        if missing and native_result:
+            self.report_warning(
+                f'yt-dlp\'s built-in Instagram extractor did not return {", ".join(missing)}; '
+                'those items may have no audio')
         return result
 
     def _extract_product_media(self, product_media):
@@ -504,6 +490,9 @@ class _InstagramHDRMixin:
             self.to_screen(
                 'No VP9/AV1 10-bit HDR representation found; using formats from '
                 'yt-dlp\'s built-in Instagram extractor')
+            # The iOS API can return raw '&' in URLs; the native XML parser is strict.
+            if dash := product_media.get('video_dash_manifest'):
+                product_media = {**product_media, 'video_dash_manifest': fix_xml_ampersands(dash)}
             return InstagramBaseIE._extract_product_media(self, product_media)
 
         best_video = videos[-1]
@@ -540,6 +529,9 @@ class _InstagramHDRMixin:
             )))),
             '_format_sort_fields': ('quality', 'res', 'br', 'fps'),
             '__instagram_hdr': True,
+            # Resolved per extractor, so instagramhdrstory:* options only affect Stories
+            '__instagram_hdr_verify': self._verification_enabled(),
+            '__instagram_hdr_hevc': self._plugin_flag('hevc'),
         }
 
 
@@ -582,14 +574,10 @@ class InstagramHDRStoryIE(_InstagramHDRMixin, InstagramStoryIE):
             return InstagramBaseIE._extract_product_media(self, product_media)
 
         media_id = str(product_media.get('pk') or '')
+        # If the lookup fails (e.g. HTTP 429), the tray item's own formats are still used
         detailed_media = traverse_obj(self._download_json(
             f'{self._API_BASE_URL}/media/{media_id}/info/', media_id,
             'Downloading HDR story info', 'HDR story info extraction failed',
             impersonate=self._can_impersonate and self._is_web_app,
-            headers=self._api_headers), ('items', 0, {dict}))
-        try:
-            return super()._extract_product_media(detailed_media or product_media)
-        except ExtractorError as error:
-            if not error.expected:
-                raise
-            return InstagramBaseIE._extract_product_media(self, detailed_media or product_media)
+            headers=self._api_headers, fatal=False), ('items', 0, {dict}))
+        return super()._extract_product_media(detailed_media or product_media)
