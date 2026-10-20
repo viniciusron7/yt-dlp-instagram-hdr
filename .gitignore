@@ -9,3 +9,6 @@ ig-hdr/
 build/
 dist/
 *.egg-info/
+arquivos/
+urls_reels_hdr.txt
+teste-hevc/

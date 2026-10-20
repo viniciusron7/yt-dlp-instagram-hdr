@@ -1,29 +1,35 @@
 from __future__ import annotations
 
 import html
-import random
 import re
 import time
-import uuid
-from datetime import datetime, timedelta
+import traceback
 from fractions import Fraction
 from typing import Any
+from urllib.parse import urlparse
 
-from yt_dlp.extractor.instagram import InstagramBaseIE, InstagramIE, InstagramStoryIE
+from yt_dlp.extractor.instagram import (
+    InstagramBaseIE,
+    InstagramIE,
+    InstagramStoryIE,
+    _id_to_pk,
+    _pk_to_id,
+)
 from yt_dlp.utils import (
     ExtractorError,
-    encode_base_n,
-    fix_xml_ampersands,
     float_or_none,
     int_or_none,
     parse_codecs,
     traverse_obj,
     url_or_none,
 )
-from yt_dlp_plugins.postprocessor.instagram_hdr import InstagramHDRHEVCPP, InstagramHDRVerifyPP
+from yt_dlp_plugins.postprocessor.instagram_hdr import (
+    InstagramHDRHEVCPP,
+    InstagramHDRSelectionPP,
+    InstagramHDRVerifyPP,
+)
 
 
-_SHORTCODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
 _IOS_USER_AGENT = (
     'Instagram 361.0.0.35.82 (iPhone16,1; iOS 18_0; en_US; en-US; '
     'scale=2.00; 2048x2732; 674117118) AppleWebKit/420+'
@@ -128,9 +134,16 @@ def _hdr_kind(attrs: dict[str, str], context: str) -> str | None:
     transfer = codec['transfer'] or cicp.get('transfer')
     tag = ' '.join((attrs.get('FBEncodingTag', ''), attrs.get('id', ''), context)).lower()
 
-    if transfer == 18 or 'hlg' in tag or 'arib-std-b67' in tag:
+    # Explicit colour metadata takes precedence over stale encoding names.
+    if transfer == 18:
         transfer_kind = 'HLG'
-    elif transfer == 16 or 'pq' in tag or 'smpte2084' in tag:
+    elif transfer == 16:
+        transfer_kind = 'HDR10'
+    elif transfer is not None:
+        return None
+    elif 'hlg' in tag or 'arib-std-b67' in tag:
+        transfer_kind = 'HLG'
+    elif 'pq' in tag or 'smpte2084' in tag:
         transfer_kind = 'HDR10'
     elif 'hdr' in tag:
         transfer_kind = 'HDR'
@@ -165,11 +178,14 @@ def _parse_manifest(manifest: str) -> list[dict[str, Any]]:
     ] or [({}, manifest)]
 
     for adaptation_attrs, body in blocks:
-        adaptation_context = _REPRESENTATION_RE.sub('', body)
+        adaptation_context = _BASE_URL_RE.sub('', _REPRESENTATION_RE.sub('', body))
         for match in _REPRESENTATION_RE.finditer(body):
             attrs = {**adaptation_attrs, **_parse_attributes(match.group('attrs'))}
             base_url = _BASE_URL_RE.search(match.group('body'))
-            if not base_url:
+            url = base_url and _decode_base_url(base_url.group('url'))
+            # Instagram's CDN serves absolute https URLs; anything else (rtmp://, ftp://,
+            # //host) must not pick the protocol or the downloader
+            if not url or not url.lower().startswith('https://'):
                 continue
 
             mime_type = attrs.get('mimeType', '').lower()
@@ -187,7 +203,7 @@ def _parse_manifest(manifest: str) -> list[dict[str, Any]]:
             tracks.append({
                 **attrs,
                 'kind': kind,
-                'url': _decode_base_url(base_url.group('url')),
+                'url': url,
                 'hdr_kind': _hdr_kind(attrs, rep_context) if kind == 'video' else None,
                 'width_int': _int_value(attrs.get('width')),
                 'height_int': _int_value(attrs.get('height')),
@@ -197,23 +213,6 @@ def _parse_manifest(manifest: str) -> list[dict[str, Any]]:
     return tracks
 
 
-def _collect_manifests(data: Any) -> list[str]:
-    manifests = []
-
-    def walk(value: Any) -> None:
-        if isinstance(value, dict):
-            for child in value.values():
-                if isinstance(child, str) and re.search(r'<MPD\b', child, re.IGNORECASE):
-                    manifests.append(child)
-                walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-
-    walk(data)
-    return list(dict.fromkeys(manifests))
-
-
 def _format_id(prefix: str, track: dict[str, Any]) -> str:
     identifier = track.get('FBEncodingTag') or track.get('id') or str(track['bandwidth_int'])
     return f'{prefix}-{identifier}'
@@ -221,11 +220,12 @@ def _format_id(prefix: str, track: dict[str, Any]) -> str:
 
 def _video_format(track: dict[str, Any], quality: int) -> dict[str, Any]:
     codec_info = parse_codecs(track.get('codecs', ''))
-    codec_info['dynamic_range'] = track['hdr_kind']
+    codec_info['dynamic_range'] = track['hdr_kind'] or 'SDR'
     return {
         'url': track['url'],
-        'format_id': _format_id('hdr', track),
-        'format_note': f'DASH video, {track["hdr_kind"]}',
+        'protocol': 'https',
+        'format_id': _format_id('hdr' if track['hdr_kind'] else 'dash', track),
+        'format_note': f'DASH video, {codec_info["dynamic_range"]}',
         'ext': 'mp4',
         'width': track['width_int'] or None,
         'height': track['height_int'] or None,
@@ -233,29 +233,27 @@ def _video_format(track: dict[str, Any], quality: int) -> dict[str, Any]:
         'vbr': float_or_none(track['bandwidth_int'], 1000),
         'tbr': float_or_none(track['bandwidth_int'], 1000),
         'filesize': int_or_none(track.get('FBContentLength')),
-        'quality': quality,
+        'quality': quality if track['hdr_kind'] else -1,
         'http_headers': {
-            'User-Agent': _IOS_USER_AGENT,
             'Referer': 'https://www.instagram.com/',
         },
         **codec_info,
     }
 
 
-def _audio_format(track: dict[str, Any], quality: int) -> dict[str, Any]:
+def _audio_format(track: dict[str, Any]) -> dict[str, Any]:
     bitrate = _int_value(track.get('FBAvgBitrate')) or track['bandwidth_int']
     return {
         'url': track['url'],
+        'protocol': 'https',
         'format_id': _format_id('audio', track),
-        'format_note': 'DASH audio, xHE-AAC',
+        'format_note': 'DASH audio, xHE-AAC' if track.get('codecs') == 'mp4a.40.42' else 'DASH audio',
         'ext': 'mp4',
         'abr': float_or_none(bitrate, 1000),
         'tbr': float_or_none(track['bandwidth_int'], 1000),
         'asr': int_or_none(track.get('audioSamplingRate')),
         'filesize': int_or_none(track.get('FBContentLength')),
-        'quality': quality,
         'http_headers': {
-            'User-Agent': _IOS_USER_AGENT,
             'Referer': 'https://www.instagram.com/',
         },
         **parse_codecs(track.get('codecs', '')),
@@ -272,13 +270,6 @@ def _is_xhe_aac(fmt: dict[str, Any]) -> bool:
     return str(fmt.get('acodec') or '').lower() == 'mp4a.40.42'
 
 
-def _filter_xhe_aac(info: dict[str, Any]) -> None:
-    for entry in _media_entries(info):
-        entry['formats'] = [
-            fmt for fmt in entry.get('formats') or [] if not _is_xhe_aac(fmt)
-        ]
-
-
 def _disambiguate_format_ids(formats: list[dict[str, Any]]) -> None:
     counts = {}
     for fmt in formats:
@@ -286,20 +277,25 @@ def _disambiguate_format_ids(formats: list[dict[str, Any]]) -> None:
         counts[format_id] = counts.get(format_id, 0) + 1
 
     indexes = {}
+    reserved = set(counts)
     for fmt in formats:
         format_id = fmt.get('format_id')
         if format_id is None or counts[format_id] < 2:
             continue
         index = indexes.get(format_id, 0)
+        while f'{format_id}-{index}' in reserved:
+            index += 1
         fmt['format_id'] = f'{format_id}-{index}'
+        reserved.add(fmt['format_id'])
         indexes[format_id] = index + 1
 
 
 def _merge_native_formats(
         info: dict[str, Any], native_info: dict[str, Any],
         include_xhe_aac: bool = False) -> list[str]:
-    # Every item gets the native formats plus what only the iOS API has (HDR video,
-    # xHE-AAC). Returns the ids of items missing from the native result.
+    # Merge HDR with the ordinary formats parsed locally from the same response.
+    # Items missing from the ordinary result keep their HDR/audio formats.
+    # xHE-AAC stays only when enabled or when it is the only audio.
     native_by_id = {
         str(entry['id']): entry
         for entry in _media_entries(native_info) if entry.get('id') is not None
@@ -307,82 +303,142 @@ def _merge_native_formats(
     missing = []
 
     for entry in _media_entries(info):
-        # Pair by id only: the two requests may list different carousel or story items
-        native_entry = native_by_id.get(str(entry.get('id')))
-        if native_entry is None:
+        # Pair by id so carousel or Story entries cannot borrow another item's audio.
+        native_formats = [dict(fmt) for fmt in traverse_obj(
+            native_by_id, (str(entry.get('id')), 'formats', ..., {dict}))]
+        if native_formats:
+            _disambiguate_format_ids(native_formats)
+            entry['formats'] = [
+                *(fmt for fmt in entry.get('formats') or []
+                  if str(fmt.get('format_id')).startswith('hdr-') or _is_xhe_aac(fmt)),
+                *native_formats,
+            ]
+        else:
             missing.append(str(entry.get('id')))
-            continue
-
-        native_formats = [dict(fmt) for fmt in native_entry.get('formats') or []]
-        _disambiguate_format_ids(native_formats)
-        entry['formats'] = [
-            *(fmt for fmt in entry.get('formats') or []
-              if str(fmt.get('format_id')).startswith('hdr-') or _is_xhe_aac(fmt)),
-            *native_formats,
-        ]
-
-    if not include_xhe_aac:
-        _filter_xhe_aac(info)
+        formats = entry.get('formats') or []
+        if not include_xhe_aac and any(
+                fmt.get('acodec') != 'none' and not _is_xhe_aac(fmt) for fmt in formats):
+            entry['formats'] = [fmt for fmt in formats if not _is_xhe_aac(fmt)]
     return missing
+
+
+def _add_post_processor(downloader, pp, when, before=()):
+    # Insert ahead of the first PP whose key is in `before`, so e.g. --embed-metadata,
+    # --xattrs and --exec act on the converted file rather than on the original
+    processors = getattr(downloader, '_pps', {}).get(when)
+    if not isinstance(processors, list):
+        return downloader.add_post_processor(pp, when=when)
+    if any(other.pp_key() == pp.pp_key() for other in processors):
+        return None  # already added, e.g. with --use-postprocessor
+    index = next((i for i, other in enumerate(processors) if other.pp_key() in before), len(processors))
+    processors.insert(index, pp)
+    return None
+
+
+class _InstagramSessionError(ExtractorError):
+    """Stop authenticated requests, including non-fatal Story/comment lookups."""
 
 
 class _InstagramHDRMixin:
     @property
     def _app_id(self):
-        return self._APP_IDS['ios']
+        return self._APP_IDS[self._api_mode()]
+
+    def _api_mode(self):
+        values = self._plugin_configuration_arg('api')
+        mode = values[-1] if values else 'web'
+        if mode not in {'web', 'ios'}:
+            raise ExtractorError('instagramhdr:api must be web or ios', expected=True)
+        return mode
 
     @property
     def _api_headers(self):
-        cookies = self._get_cookies('https://i.instagram.com/')
-
-        def cookie(name):
-            value = cookies.get(name)
-            return value.value if value else None
-
-        user_id = cookie('ds_user_id')
-        device_id = cookie('ig_did')
-        headers = {
-            'User-Agent': _IOS_USER_AGENT,
-            'Accept': '*/*',
-            'x-ads-opt-out': '1',
-            'x-bloks-is-panorama-enabled': 'true',
-            'x-bloks-version-id': '16b7bd25c6c06886d57c4d455265669345a2d96625385b8ee30026ac2dc5ed97',
-            'x-fb-client-ip': 'True',
-            'x-fb-connection-type': 'wifi',
-            'x-fb-http-engine': 'Liger',
-            'x-fb-server-cluster': 'True',
-            'x-fb': '1',
-            'x-ig-abr-connection-speed-kbps': '2',
-            'x-ig-app-id': self._APP_IDS['ios'],
-            'x-ig-app-locale': 'en-US',
-            'x-ig-app-startup-country': 'US',
-            'x-ig-bandwidth-speed-kbps': '0.000',
-            'x-ig-capabilities': '36r/F/8=',
-            'x-ig-connection-speed': f'{random.randint(1000, 20000)}kbps',
-            'x-ig-connection-type': 'WiFi',
-            'x-ig-device-locale': 'en-US',
-            'x-ig-mapped-locale': 'en-US',
-            'x-ig-timezone-offset': str(int(
-                (datetime.now().astimezone().utcoffset() or timedelta()).total_seconds())),
-            'x-ig-www-claim': '0',
-            'x-pigeon-rawclienttime': f'{time.time():.6f}',
-            'x-pigeon-session-id': str(uuid.uuid4()),
-            'x-tigon-is-retry': 'False',
-            'x-whatsapp': '0',
-        }
-        optional_headers = {
-            'ig-intended-user-id': user_id,
-            'x-mid': cookie('mid'),
-            'ig-u-ds-user-id': user_id,
-            'x-ig-device-id': device_id,
-            'x-ig-family-device-id': device_id,
-            'family_device_id': device_id,
-            'X-CSRFToken': cookie('csrftoken'),
-        }
-        headers.update({key: value for key, value in optional_headers.items() if value})
-        if rur := cookie('rur'):
-            headers['ig-u-rur'] = rur.strip('"').encode().decode('unicode_escape')
+        headers = dict(super()._api_headers)
+        if self._api_mode() == 'ios':
+            # Kept as an explicit compatibility option; never fabricate device IDs,
+            # bandwidth, telemetry or a fresh mobile session for browser cookies.
+            headers['User-Agent'] = _IOS_USER_AGENT
+            headers['X-IG-Capabilities'] = '36r/F/8='
+        if csrf := self._get_cookies(self._BASE_URL).get('csrftoken'):
+            headers['X-CSRFToken'] = csrf.value
         return headers
+
+    @property
+    def _access_state(self):
+        # Reels, Stories and comments in the same run share the stop flag and pacing.
+        return self._downloader if self._downloader is not None else self
+
+    def _check_access(self):
+        if message := getattr(self._access_state, '_instagram_hdr_access_blocked', None):
+            raise _InstagramSessionError(message, expected=True)
+
+    def _stop_access(self, reason):
+        message = (
+            f'Instagram {reason}. Further Instagram requests through this plugin are stopped for this run. '
+            'Check the account in Instagram and resolve any verification or restriction '
+            'before trying again; do not repeatedly refresh cookies or retry')
+        self._access_state._instagram_hdr_access_blocked = message
+        raise _InstagramSessionError(message, expected=True)
+
+    @staticmethod
+    def _restricted_url(url):
+        return bool(re.match(
+            r'^/(?:accounts/(?:login|suspended|disabled)|challenge|checkpoint|consent)(?:/|$)',
+            urlparse(url or '').path))
+
+    def _request_webpage(self, url_or_request, video_id, note=None, errnote=None, fatal=True, **kwargs):
+        self._check_access()
+        # yt-dlp implements an explicit --sleep-requests value itself. Supply a
+        # conservative default when it was not set, without mutating global options.
+        if self.get_param('sleep_interval_requests') is None:
+            last = getattr(self._access_state, '_instagram_hdr_last_request', None)
+            if last is not None:
+                delay = 2.0 - (time.monotonic() - last)
+                if delay > 0:
+                    time.sleep(delay)
+        self._access_state._instagram_hdr_last_request = time.monotonic()
+        try:
+            # Inspect errors even when the caller requested fatal=False.
+            response = super()._request_webpage(
+                url_or_request, video_id, note, None if errnote is False else errnote,
+                fatal=True, **kwargs)
+        except ExtractorError as error:
+            status = getattr(error.cause, 'status', None)
+            response_url = getattr(getattr(error.cause, 'response', None), 'url', None)
+            if status in {401, 403, 404, 429} or self._restricted_url(response_url):
+                self._stop_access(f'rejected access (HTTP {status})' if status else 'requested account verification')
+            if fatal:
+                raise
+            if errnote is not False:
+                self.report_warning(error.orig_msg)
+            return False
+        if response and getattr(response, 'status', None) in {401, 403, 404, 429}:
+            self._stop_access(f'rejected access (HTTP {response.status})')
+        if response and self._restricted_url(getattr(response, 'url', None)):
+            self._stop_access('redirected to login or account verification')
+        return response
+
+    def _download_json(self, *args, **kwargs):
+        self._check_access()
+        result = super()._download_json(*args, **kwargs)
+        if isinstance(result, dict):
+            signals = ' '.join(str(result.get(key) or '') for key in (
+                'message', 'error_type', 'feedback_title', 'feedback_message')).lower()
+            if (result.get('status') == 'fail'
+                    or any(result.get(key) for key in (
+                        'challenge', 'challenge_required', 'checkpoint_url',
+                        'feedback_required', 'feedback_url', 'spam'))
+                    or re.search(r'challenge|checkpoint|login_required|login required|feedback_required|'
+                                 r'consent_required|rate.?limit|please wait|wait a few minutes|'
+                                 r'sentry_block|suspend|disabled|try again later|'
+                                 r'we restrict certain activity', signals)):
+                self._stop_access('requested verification or restricted this session')
+        return result
+
+    @classmethod
+    def suitable(cls, url):
+        # The built-in extractor runs on the same URL too, so never claim one it rejects
+        return super().suitable(url) and cls._NATIVE_IE.suitable(url)
 
     @staticmethod
     def _is_auth_rejection(error: ExtractorError) -> bool:
@@ -406,14 +462,15 @@ class _InstagramHDRMixin:
         return self._plugin_flag('verify', default=True)
 
     def _real_initialize(self):
+        self._check_access()
         if self._plugin_flag('disable'):
             self._fallback_to_native = True
             self.to_screen(
                 'Instagram HDR plugin disabled; using yt-dlp\'s built-in extractor')
             return
 
-        cookies = self._get_cookies('https://i.instagram.com/')
-        if not cookies.get('sessionid') or not cookies.get('ds_user_id'):
+        cookies = self._get_cookies(self._BASE_URL)
+        if not cookies.get('sessionid'):
             self._fallback_to_native = True
             self.report_warning(
                 'Authenticated Instagram cookies were not supplied; HDR formats are '
@@ -421,51 +478,56 @@ class _InstagramHDRMixin:
                 'Pass --cookies-from-browser BROWSER or --cookies FILE to enable HDR.',
             )
             return
-        if not getattr(self._downloader, '_instagram_hdr_verifier_registered', False):
-            # One registration serves every URL; each item carries its own options
-            self._downloader.add_post_processor(
-                InstagramHDRHEVCPP(self._downloader), when='post_process')
-            self._downloader.add_post_processor(
-                InstagramHDRVerifyPP(self._downloader), when='after_move')
-            self._downloader._instagram_hdr_verifier_registered = True
+        if self._api_mode() == 'ios':
+            self.report_warning(
+                'The optional iOS API uses a mobile client with browser cookies and can '
+                'put the account at risk. Prefer the default instagramhdr:api=web mode',
+                only_once=True)
+        # Added once per YoutubeDL (later calls are no-ops); each item carries its own options.
+        # The HEVC conversion runs after -x but before the steps that act on the final file,
+        # including --remux-video, so the user's container choice applies last
+        downloader = self._downloader
+        _add_post_processor(downloader, InstagramHDRSelectionPP(downloader), 'video')
+        _add_post_processor(downloader, InstagramHDRHEVCPP(downloader), 'post_process', before={
+            'VideoRemuxer', 'VideoConvertor', 'EmbedSubtitle', 'ModifyChapters', 'Metadata',
+            'EmbedThumbnail', 'SplitChapters', 'XAttrMetadata', 'Exec'})
+        _add_post_processor(downloader, InstagramHDRVerifyPP(downloader), 'after_move', before={'Exec'})
         return super()._real_initialize()
 
+    def _native_url_result(self, url):
+        match = self._match_valid_url(url)
+        video_id = match.groupdict().get('id') or match.groupdict().get('user')
+        return self.url_result(url, ie=self._NATIVE_IE, video_id=video_id)
+
+    def _extract_api(self, url):
+        return super()._real_extract(url)
+
     def _real_extract(self, url):
+        self._check_access()
         if getattr(self, '_fallback_to_native', False):
-            match = self._match_valid_url(url)
-            video_id = match.groupdict().get('id') or match.groupdict().get('user')
-            return self.url_result(url, ie=self._NATIVE_IE, video_id=video_id)
+            return self._native_url_result(url)
         try:
-            result = super()._real_extract(url)
-        except ExtractorError as error:
-            if not self._is_auth_rejection(error):
+            return self._extract_api(url)
+        except _InstagramSessionError:
+            raise
+        except (ExtractorError, AttributeError, KeyError, IndexError, TypeError, ValueError) as error:
+            if isinstance(error, ExtractorError):
+                status = getattr(error.cause, 'status', None)
+                if status in {401, 403, 404, 429}:
+                    self._stop_access(f'rejected access (HTTP {status})')
+                # Do not repeat authenticated extraction with another client, including
+                # 404 (which Instagram also uses for session restrictions).
                 raise
-            raise ExtractorError(
-                'Instagram rejected the cookies supplied to yt-dlp (HTTP 401/403). '
-                'Log into Instagram again and refresh --cookies-from-browser or --cookies.',
-                expected=True,
-            ) from error
-
-        self.to_screen('Loading all formats with yt-dlp\'s built-in Instagram extractor')
-        try:
-            native_result = self._NATIVE_IE(self._downloader).extract(url) or {}
-        except ExtractorError as error:
-            self.report_warning(
-                f'Built-in Instagram extractor could not load formats: {error}')
-            native_result = {}
-
-        missing = _merge_native_formats(
-            result, native_result, self._plugin_flag('include_xhe_aac'))
-        if missing and native_result:
-            self.report_warning(
-                f'yt-dlp\'s built-in Instagram extractor did not return {", ".join(missing)}; '
-                'those items may have no audio')
-        return result
+            else:
+                self.write_debug(''.join(traceback.format_exception(error)))
+                raise ExtractorError(
+                    'Instagram returned unexpected media data; stopped without another '
+                    'authenticated extraction', cause=error) from error
 
     def _extract_product_media(self, product_media):
-        tracks = []
-        for manifest in _collect_manifests(product_media):
-            tracks.extend(_parse_manifest(manifest))
+        # Only the item's own manifest: other strings are user-written (caption) or belong
+        # to other media (original sound, reshared post) and must never become formats
+        tracks = _parse_manifest(traverse_obj(product_media, ('video_dash_manifest', {str})) or '')
 
         unique_tracks = list({
             (track['kind'], track['url']): track
@@ -480,64 +542,53 @@ class _InstagramHDRMixin:
                 track['frame_rate_float'],
             ),
         )
-        xhe_audios = sorted(
+        audios = sorted(
             (track for track in unique_tracks
-             if track['kind'] == 'audio'
-             and parse_codecs(track.get('codecs', '')).get('acodec') == 'mp4a.40.42'),
+             if track['kind'] == 'audio'),
             key=lambda track: track['bandwidth_int'],
         )
+        # Read progressive formats and metadata with yt-dlp's parser, then add all
+        # DASH tracks locally. No second API call or client switch is needed. Our
+        # manifest parser also tolerates Instagram's unescaped ampersands.
+        native = InstagramBaseIE._extract_product_media(
+            self, {**product_media, 'video_dash_manifest': ''})
+        native['formats'] = [
+            *(_video_format(track, -1) for track in unique_tracks
+              if track['kind'] == 'video' and not track['hdr_kind']),
+            *map(_audio_format, audios),
+            *native['formats'],
+        ]
+        result = {**native, 'formats': [
+            _video_format(track, quality) for quality, track in enumerate(videos)]}
+        include_xhe_aac = self._plugin_flag('include_xhe_aac')
+        _merge_native_formats(result, native, include_xhe_aac)
+        _disambiguate_format_ids(result['formats'])
         if not videos:
-            self.to_screen(
-                'No VP9/AV1 10-bit HDR representation found; using formats from '
-                'yt-dlp\'s built-in Instagram extractor')
-            # The iOS API can return raw '&' in URLs; the native XML parser is strict.
-            if dash := product_media.get('video_dash_manifest'):
-                product_media = {**product_media, 'video_dash_manifest': fix_xml_ampersands(dash)}
-            return InstagramBaseIE._extract_product_media(self, product_media)
+            self.to_screen('No VP9/AV1 10-bit HDR representation found; using available SDR formats')
+            return result
 
         best_video = videos[-1]
-        include_xhe_aac = self._plugin_flag('include_xhe_aac')
         message = (
-            f'Selected HDR ladder: up to {best_video["width_int"]}x{best_video["height_int"]}, '
+            f'HDR formats available: up to {best_video["width_int"]}x{best_video["height_int"]}, '
             f'{best_video["frame_rate_float"]:g} fps, {best_video["hdr_kind"]}')
         if include_xhe_aac:
+            xhe_audios = [track for track in audios if track.get('codecs') == 'mp4a.40.42']
             message += f'; {len(xhe_audios)} xHE-AAC audio format(s) enabled'
         self.to_screen(message)
 
-        media_id = traverse_obj(product_media, ('pk', {str}))
-        if not media_id:
-            media_id = str(product_media.get('pk') or '')
-        shortcode = encode_base_n(
-            int(media_id.split('_')[0]), table=_SHORTCODE_ALPHABET) if media_id else None
-
         return {
-            'id': shortcode,
-            'formats': [
-                *(_video_format(track, quality) for quality, track in enumerate(videos)),
-                *((_audio_format(track, quality)
-                   for quality, track in enumerate(xhe_audios))
-                  if include_xhe_aac else ()),
-            ],
-            'duration': traverse_obj(product_media, ('video_duration', {float_or_none})),
-            'thumbnails': list(reversed(traverse_obj(product_media, (
-                'image_versions2', 'candidates',
-                lambda _, candidate: url_or_none(candidate['url']), {
-                    'url': ('url', {url_or_none}),
-                    'width': ('width', {int_or_none}),
-                    'height': ('height', {int_or_none}),
-                },
-            )))),
+            **result,
             '_format_sort_fields': ('quality', 'res', 'br', 'fps'),
-            '__instagram_hdr': True,
+            '_instagram_hdr': True,
             # Resolved per extractor, so instagramhdrstory:* options only affect Stories
-            '__instagram_hdr_verify': self._verification_enabled(),
-            '__instagram_hdr_hevc': self._plugin_flag('hevc'),
+            '_instagram_hdr_verify': self._verification_enabled(),
+            '_instagram_hdr_hevc': self._plugin_flag('hevc'),
         }
 
 
 class InstagramHDRIE(_InstagramHDRMixin, InstagramIE):
     IE_NAME = 'instagram:hdr'
-    IE_DESC = 'Instagram videos and Reels HDR (authenticated iOS API)'
+    IE_DESC = 'Instagram videos and Reels with HDR formats'
     _NATIVE_IE = InstagramIE
     _VALID_URL = (
         r'(?P<url>https?://(?:www\.)?instagram\.com'
@@ -551,10 +602,23 @@ class InstagramHDRIE(_InstagramHDRMixin, InstagramIE):
         'only_matching': True,
     }]
 
+    def _extract_api(self, url):
+        # Keep the session intact if a request is rejected. The native extractor
+        # clears sessionid on login redirects and continues with more requests.
+        video_id = self._match_id(url)
+        item = traverse_obj(self._download_json(
+            f'{self._API_BASE_URL}/media/{_id_to_pk(video_id)}/info/', video_id,
+            'Downloading video info', 'Video info extraction failed',
+            impersonate=self._can_impersonate and self._is_web_app,
+            headers=self._api_headers), ('items', 0, {dict}))
+        if not item:
+            raise ExtractorError('Instagram returned no media item')
+        return self._extract_product(item)
+
 
 class InstagramHDRStoryIE(_InstagramHDRMixin, InstagramStoryIE):
     IE_NAME = 'instagram:story:hdr'
-    IE_DESC = 'Instagram Stories HDR (authenticated iOS API)'
+    IE_DESC = 'Instagram Stories with HDR formats'
     _NATIVE_IE = InstagramStoryIE
     _TESTS = [{
         'url': 'https://www.instagram.com/stories/pablo_quero_leite/',
@@ -563,6 +627,45 @@ class InstagramHDRStoryIE(_InstagramHDRMixin, InstagramStoryIE):
         'url': 'https://www.instagram.com/stories/pablo_quero_leite/1234567890/',
         'only_matching': True,
     }]
+
+    def _extract_api(self, url):
+        username, story_id = self._match_valid_url(url).group('user', 'id')
+        if username == 'highlights' and not story_id:
+            raise ExtractorError('Input URL is missing a highlight ID', expected=True)
+        display_id = story_id or username
+        webpage = self._download_webpage(
+            url, display_id, impersonate=self._can_impersonate and self._is_web_app)
+        user_info = self._search_json(r'"user":', webpage, 'user info', display_id, fatal=False)
+        if not user_info:
+            raise ExtractorError('Instagram Story user information is unavailable', expected=True)
+        user_id = str(user_info.get('pk') or user_info.get('id') or '')
+        if username != 'highlights' and not user_id:
+            raise ExtractorError('Unable to extract user id', expected=True)
+        reel_id = f'highlight:{story_id}' if username == 'highlights' else user_id
+        reels = traverse_obj(self._download_json(
+            f'{self._API_BASE_URL}/feed/reels_media/', display_id,
+            query={'reel_ids': reel_id}, headers=self._api_headers,
+            impersonate=self._can_impersonate and self._is_web_app), ('reels', {dict})) or {}
+        reel = reels.get(reel_id) or {}
+        highlights = traverse_obj(reel, ('items', ..., {dict}))
+        if not highlights:
+            raise ExtractorError('No accessible Stories were returned by Instagram', expected=True)
+        only_story = username != 'highlights' and story_id and not self._yes_playlist(username, story_id)
+        if only_story:
+            # Select before detail lookups: a single Story must not query the rest.
+            highlights = [item for item in highlights
+                          if str(item.get('pk', '')).split('_')[0] == story_id]
+        owner = reel.get('user') or user_info
+        entries = []
+        for item in highlights:
+            product = {**item, 'user': {**(item.get('user') or {}), **owner}}
+            entry = self._extract_product(product)
+            if entry.get('formats'):
+                entries.append(entry)
+        if only_story:
+            return next(iter(entries), None)
+        return self.playlist_result(
+            entries, playlist_id=story_id, playlist_title=reel.get('title') or f'Story by {username}')
 
     def _extract_product_media(self, product_media):
         is_video = bool(
@@ -574,10 +677,14 @@ class InstagramHDRStoryIE(_InstagramHDRMixin, InstagramStoryIE):
             return InstagramBaseIE._extract_product_media(self, product_media)
 
         media_id = str(product_media.get('pk') or '')
-        # If the lookup fails (e.g. HTTP 429), the tray item's own formats are still used
+        tray_manifest = traverse_obj(product_media, ('video_dash_manifest', {str})) or ''
+        if not media_id or any(track['hdr_kind'] for track in _parse_manifest(tray_manifest)):
+            return super()._extract_product_media(product_media)
+        # The tray may omit HDR even when it includes SDR DASH. Enrich only items
+        # without an HDR manifest, using the same client and access protections.
         detailed_media = traverse_obj(self._download_json(
             f'{self._API_BASE_URL}/media/{media_id}/info/', media_id,
             'Downloading HDR story info', 'HDR story info extraction failed',
             impersonate=self._can_impersonate and self._is_web_app,
             headers=self._api_headers, fatal=False), ('items', 0, {dict}))
-        return super()._extract_product_media(detailed_media or product_media)
+        return super()._extract_product_media({**product_media, **(detailed_media or {})})
