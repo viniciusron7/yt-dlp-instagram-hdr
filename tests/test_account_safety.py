@@ -239,6 +239,143 @@ class AccountSafetyTests(unittest.TestCase):
         self.assertIn('mp4a.40.2', [fmt.get('acodec') for fmt in result['formats']])
         self.assertEqual(item, original)
 
+    def test_default_auto_finds_ios_hdr_and_selects_web_audio_with_bv_plus_ba(self):
+        extractor = self.make_extractor(format='bv+ba', simulate=True, check_formats=False)
+        web = {
+            'pk': '123', 'media_type': 2,
+            'video_dash_manifest': media_manifest().replace(
+                'vp09.02.40.10.01.09.18.09.00', 'avc1.640028').replace(
+                    'https://cdn.example/hdr.mp4', 'https://cdn.example/web.mp4'),
+            'video_versions': [{'id': 'progressive', 'url': 'https://cdn.example/progressive.mp4'}],
+        }
+        ios = {**web, 'video_dash_manifest': media_manifest().replace(
+            '<Representation id="aac" codecs="mp4a.40.2" bandwidth="128000">'
+            '\n          <BaseURL>https://cdn.example/aac.mp4</BaseURL>'
+            '\n        </Representation>', '')}
+        original = copy.deepcopy((web, ios))
+        with mock.patch.object(InstagramBaseIE, '_download_json', side_effect=[
+                {'items': [web]}, {'items': [ios]}]) as download:
+            result = extractor._real_extract('https://www.instagram.com/p/De7p7t9Rfaw/')
+        self.assertEqual(download.call_count, 2)
+        first, second = download.call_args_list
+        self.assertIn('https://www.instagram.com/', first.args[0])
+        self.assertIn('https://i.instagram.com/', second.args[0])
+        self.assertEqual(first.kwargs['headers']['X-IG-App-ID'], extractor._APP_IDS['web'])
+        self.assertEqual(second.kwargs['headers']['X-IG-App-ID'], extractor._APP_IDS['ios'])
+        self.assertEqual(second.kwargs['headers']['User-Agent'], plugin._IOS_USER_AGENT)
+        self.assertEqual(second.kwargs['headers']['X-CSRFToken'], 'offline-csrf')
+        self.assertFalse(second.kwargs['impersonate'])
+        self.assertTrue(result['_instagram_hdr'])
+        self.assertEqual(len({fmt['url'] for fmt in result['formats']}), len(result['formats']))
+        self.assertFalse(any(plugin._is_xhe_aac(fmt) for fmt in result['formats']))
+        selected = extractor._downloader.process_ie_result({**result, 'title': 'Video'}, download=False)
+        self.assertEqual([fmt['url'] for fmt in selected['requested_formats']], [
+            'https://cdn.example/hdr.mp4', 'https://cdn.example/aac.mp4'])
+        self.assertEqual(selected['dynamic_range'], 'HLG')
+        self.assertEqual((web, ios), original)
+
+    def test_explicit_web_does_not_request_ios_for_sdr(self):
+        extractor = self.make_extractor(extractor_args={'instagramhdr': {'api': ['web']}})
+        item = {'pk': '123', 'video_versions': [{'url': 'https://cdn.example/sdr.mp4'}]}
+        with mock.patch.object(InstagramBaseIE, '_download_json', return_value={'items': [item]}) as download:
+            result = extractor._real_extract('https://www.instagram.com/reel/ABC/')
+        download.assert_called_once()
+        self.assertNotIn('_instagram_hdr', result)
+        self.assertEqual(result['formats'][0]['url'], 'https://cdn.example/sdr.mp4')
+
+    def test_auto_fills_missing_audio_and_ranks_the_combined_hdr_ladder(self):
+        extractor = self.make_extractor(format='bv+ba', simulate=True, check_formats=False)
+        web = {'pk': '123', 'video_dash_manifest': media_manifest().split(
+            '<AdaptationSet contentType="audio"')[0] + '</Period></MPD>'}
+        ios = {'pk': '123', 'video_dash_manifest': media_manifest().replace(
+            'width="1080" height="1920"', 'width="720" height="1280"').replace(
+                'https://cdn.example/hdr.mp4', 'https://cdn.example/ios-low.mp4').replace(
+                    'id="sdr" codecs="avc1.640028" bandwidth="2000000"',
+                    'id="mid-hdr" codecs="vp09.02.40.10.01.09.18.09.00" '
+                    'bandwidth="3000000" width="900" height="1600"')}
+        with mock.patch.object(InstagramBaseIE, '_download_json', side_effect=[
+                {'items': [web]}, {'items': [ios]}]) as download:
+            result = extractor._real_extract('https://www.instagram.com/reel/ABC/')
+        self.assertEqual(download.call_count, 2)
+        selected = extractor._downloader.process_ie_result({**result, 'title': 'Video'}, download=False)
+        self.assertEqual([fmt['url'] for fmt in selected['requested_formats']], [
+            'https://cdn.example/hdr.mp4', 'https://cdn.example/aac.mp4'])
+        self.assertEqual(selected['height'], 1920)
+
+    def test_ios_supplements_compatible_audio_from_web(self):
+        extractor = self.make_extractor(
+            format='bv+ba', simulate=True, check_formats=False,
+            extractor_args={'instagramhdr': {'api': ['ios']}})
+        ios = {'pk': '123', 'video_dash_manifest': media_manifest().replace(
+            'mp4a.40.2', 'mp4a.40.42').replace(
+                'https://cdn.example/aac.mp4', 'https://cdn.example/ios-xhe.mp4')}
+        web = {'pk': '123', 'video_dash_manifest': media_manifest().replace(
+            'vp09.02.40.10.01.09.18.09.00', 'avc1.640028').replace(
+                'https://cdn.example/hdr.mp4', 'https://cdn.example/web.mp4')}
+        with mock.patch.object(InstagramBaseIE, '_download_json', side_effect=[
+                {'items': [ios]}, {'items': [web]}]) as download:
+            result = extractor._real_extract('https://www.instagram.com/reel/ABC/')
+        self.assertEqual(download.call_count, 2)
+        self.assertIn('https://i.instagram.com/', download.call_args_list[0].args[0])
+        self.assertIn('https://www.instagram.com/', download.call_args_list[1].args[0])
+        self.assertNotIn('User-Agent', download.call_args_list[1].kwargs['headers'])
+        selected = extractor._downloader.process_ie_result({**result, 'title': 'Video'}, download=False)
+        self.assertEqual([fmt['acodec'] for fmt in selected['requested_formats']], ['none', 'mp4a.40.2'])
+
+    def test_xhe_audio_survives_progressive_video_when_it_is_the_only_separate_audio(self):
+        extractor = self.make_extractor(format='bv+ba', simulate=True, check_formats=False)
+        item = {
+            'pk': '123', 'video_dash_manifest': media_manifest().replace('mp4a.40.2', 'mp4a.40.42'),
+            'video_versions': [{'url': 'https://cdn.example/progressive.mp4'}],
+        }
+        result = extractor._extract_product(item)
+        selected = extractor._downloader.process_ie_result({**result, 'title': 'Video'}, download=False)
+        self.assertEqual([fmt['acodec'] for fmt in selected['requested_formats']], ['none', 'mp4a.40.42'])
+
+    def test_auto_supplement_never_borrows_formats_from_other_carousel_items(self):
+        extractor = self.make_extractor()
+        web = {'pk': '1', 'carousel_media': [
+            {'pk': '123', 'video_versions': [{'url': 'https://cdn.example/123.mp4'}]},
+            {'pk': '456', 'video_versions': [{'url': 'https://cdn.example/456.mp4'}]},
+        ]}
+        ios = {'pk': '1', 'carousel_media': [
+            {'pk': '789', 'video_dash_manifest': media_manifest()},
+            {'pk': '456', 'video_dash_manifest': media_manifest()},
+        ]}
+        with mock.patch.object(InstagramBaseIE, '_download_json', side_effect=[
+                {'items': [web]}, {'items': [ios]}]):
+            result = extractor._real_extract('https://www.instagram.com/p/ABC/')
+        first, second = result['entries']
+        self.assertEqual([entry['id'] for entry in result['entries']], [plugin._pk_to_id('123'), plugin._pk_to_id('456')])
+        self.assertEqual(first['formats'], [{'url': 'https://cdn.example/123.mp4'}])
+        self.assertNotIn('_instagram_hdr', first)
+        self.assertTrue(second['_instagram_hdr'])
+        self.assertEqual({fmt['url'] for fmt in second['formats']}, {
+            'https://cdn.example/456.mp4', 'https://cdn.example/hdr.mp4',
+            'https://cdn.example/sdr.mp4', 'https://cdn.example/aac.mp4'})
+
+    def test_restricted_auto_supplement_stops_all_followup_requests(self):
+        for status in (401, 403, 404, 429):
+            with self.subTest(status=status):
+                extractor = self.make_extractor()
+                web = {'pk': '123', 'video_versions': [{'url': 'https://cdn.example/sdr.mp4'}]}
+                with mock.patch.object(InstagramBaseIE, '_download_json', side_effect=[
+                        {'items': [web]}, ExtractorError('restricted', cause=HTTPFailure(status))]) as download:
+                    with self.assertRaises(plugin._InstagramSessionError):
+                        extractor._real_extract('https://www.instagram.com/reel/ABC/')
+                    with self.assertRaises(plugin._InstagramSessionError):
+                        extractor._real_extract('https://www.instagram.com/reel/DEF/')
+                self.assertEqual(download.call_count, 2)
+
+    def test_empty_supplement_keeps_successful_web_formats(self):
+        extractor = self.make_extractor()
+        web = {'pk': '123', 'video_versions': [{'url': 'https://cdn.example/sdr.mp4'}]}
+        with mock.patch.object(InstagramBaseIE, '_download_json', side_effect=[
+                {'items': [web]}, None]) as download:
+            result = extractor._real_extract('https://www.instagram.com/reel/ABC/')
+        self.assertEqual(download.call_count, 2)
+        self.assertEqual(result['formats'], [{'url': 'https://cdn.example/sdr.mp4'}])
+
     def test_story_with_manifest_skips_detail_request(self):
         extractor = self.make_extractor(plugin.InstagramHDRStoryIE)
         with mock.patch.object(InstagramBaseIE, '_download_json', side_effect=AssertionError('unnecessary detail lookup')):
@@ -268,6 +405,26 @@ class AccountSafetyTests(unittest.TestCase):
         self.assertIn('mp4a.40.2', [fmt.get('acodec') for fmt in result['formats']])
         self.assertEqual(tray, original_tray)
         self.assertEqual(detail, original_detail)
+
+    def test_story_auto_finds_ios_hdr_without_losing_web_tray_audio(self):
+        extractor = self.make_extractor(
+            plugin.InstagramHDRStoryIE, format='bv+ba', simulate=True, check_formats=False)
+        tray = {'pk': '123', 'media_type': 2, 'video_dash_manifest': media_manifest().replace(
+            'vp09.02.40.10.01.09.18.09.00', 'avc1.640028').replace(
+                'https://cdn.example/hdr.mp4', 'https://cdn.example/web.mp4')}
+        web_detail = {'pk': '123', 'media_type': 2,
+                      'video_versions': [{'url': 'https://cdn.example/progressive.mp4'}]}
+        ios_detail = {'pk': '123', 'video_dash_manifest': media_manifest().replace(
+            'mp4a.40.2', 'mp4a.40.42').replace(
+                'https://cdn.example/aac.mp4', 'https://cdn.example/ios-xhe.mp4')}
+        with mock.patch.object(InstagramBaseIE, '_download_json', side_effect=[
+                {'items': [web_detail]}, {'items': [ios_detail]}]) as download:
+            result = extractor._extract_product_media(tray)
+        self.assertEqual(download.call_count, 2)
+        self.assertTrue(result['_instagram_hdr'])
+        selected = extractor._downloader.process_ie_result({**result, 'title': 'Story'}, download=False)
+        self.assertEqual([fmt['url'] for fmt in selected['requested_formats']], [
+            'https://cdn.example/hdr.mp4', 'https://cdn.example/aac.mp4'])
 
     def test_generated_format_ids_do_not_collide_with_original_ids(self):
         formats = [

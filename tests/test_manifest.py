@@ -590,7 +590,7 @@ class ManifestTests(unittest.TestCase):
         native = {'_type': 'playlist', 'entries': [{'id': 'HDR', 'formats': []}]}
         self.assertEqual(_merge_native_formats(info, native), ['HDR', 'SDR'])
         self.assertEqual([[fmt['format_id'] for fmt in entry['formats']] for entry in info['entries']],
-                         [['hdr-v', 'ios-xhe'], ['progressive']])
+                         [['hdr-v', 'ios-xhe'], ['progressive', 'ios-xhe']])
 
     def test_missing_story_returns_nothing_without_the_native_pass(self):
         extractor = InstagramHDRStoryIE()

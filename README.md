@@ -2,10 +2,14 @@
 
 A [yt-dlp](https://github.com/yt-dlp/yt-dlp) plugin that adds HDR formats for Instagram Reels, Stories, and video posts.
 
-Supports VP9 Profile 2 and AV1 10-bit HDR. By default, the plugin uses Instagram's
-web API and builds HDR, SDR, progressive video and audio formats from the same
-media response, avoiding a second authenticated extraction. xHE-AAC is excluded
-unless explicitly enabled, or unless it is the only audio available.
+Supports VP9 Profile 2 and AV1 10-bit HDR. By default, the plugin starts with
+Instagram's web API and checks the iOS API when a successful web response lacks
+HDR or separate audio. It combines HDR, SDR, progressive video and audio formats
+for the same media item, so no extra extractor arguments are needed for HDR
+discovery or `bv+ba`.
+xHE-AAC is excluded unless explicitly enabled, or unless it is the only
+audio-only format available; a progressive video never replaces a separate audio
+track.
 Video and audio are merged without re-encoding (unless the `hevc` option is enabled)
 and the HDR video is verified with `ffprobe`.
 
@@ -160,8 +164,15 @@ yt-dlp -F --cookies-from-browser chrome "VIDEO_URL"
 ```
 
 Plugin HDR formats have IDs starting with `hdr-`. To explicitly select separate
-video and audio streams, add `-f "bv+ba"`. For silent videos, use the default
-selection instead, since an audio-only stream may not exist.
+video and audio streams:
+
+```shell
+yt-dlp -f "bv+ba" --cookies-from-browser chrome "VIDEO_URL"
+```
+
+The automatic API selection preserves compatible audio from the web response
+when HDR comes from iOS. For silent videos, use the default selection instead,
+since an audio-only stream may not exist.
 
 You can also use a cookie file:
 
@@ -178,10 +189,14 @@ keeps the available SDR and audio formats from the same response.
 
 ### Account access and request limits
 
-The default `api=web` uses the web application ID and yt-dlp's browser headers.
-It does not assign browser device cookies to a fictitious mobile device, generate
-random telemetry, or automatically switch clients. Changing headers cannot make
-authenticated automation indistinguishable from normal browsing.
+The default `api=auto` starts with the web application ID and yt-dlp's browser
+headers. After a successful response without HDR or separate audio, it makes one
+additional media request using the iOS application ID and user agent, then
+combines formats by media ID. This uses a mobile application identity with
+browser cookies and carries the account risk described above. Use `instagramhdr:api=web` to restrict
+extraction to the web API. Neither mode fabricates device IDs or random telemetry.
+Changing headers cannot make authenticated automation indistinguishable from
+normal browsing.
 
 Metadata requests made by this plugin are spaced by two seconds by default,
 shared between Reels and Stories in the same yt-dlp run. Use yt-dlp's
@@ -200,25 +215,26 @@ that yt-dlp process, not a persistent or cross-process account lock. Extractors
 outside this plugin, including the explicitly disabled mode, retain yt-dlp's own
 behavior.
 
-Stories reuse an existing HDR manifest; a detail request is made only when the
-tray omits HDR (a tray's SDR manifest can omit available HDR). With a specific
-Story URL and `--no-playlist`, other Stories are
+Stories preserve the tray's available audio and video formats. When the tray
+omits HDR, the plugin requests media details (a tray's SDR manifest can omit
+available HDR). Automatic mode also checks iOS when HDR or separate audio is
+still missing. With a specific Story URL and `--no-playlist`, other Stories are
 not queried for media details.
 
-Instagram can return different formats for web and mobile clients. For uploads
-whose HDR formats are only available through the iOS API, the previous API path
-remains available as an explicit compatibility option:
+Instagram can return different formats for web and mobile clients. Automatic
+mode handles this without extra arguments. To start directly with the iOS API:
 
 ```shell
 yt-dlp --cookies-from-browser "chrome:PROFILE_DIRECTORY" --extractor-args "instagramhdr:api=ios" "VIDEO_URL"
 ```
 
-This option uses a mobile application identity with browser cookies, carries
-additional account risk and prints a warning. It retains the request interval
-and stop protections. It is never enabled automatically when web HDR is absent.
-Both modes preserve the available VP9/AV1 HDR downloads, optional HEVC
-conversion, Stories and the audio options below. Availability still depends on
-the API response; the plugin cannot force Instagram to expose an HDR rendition.
+This option prints a warning and also checks the web API when the iOS response
+lacks compatible separate audio, unless `include_xhe_aac` is enabled and xHE-AAC
+audio is available. All modes retain the request interval and stop protections;
+an access rejection never triggers a request with another client. They preserve
+the available VP9/AV1 HDR downloads, optional HEVC conversion, Stories and the
+audio options below. Availability still depends on the API responses; the plugin
+cannot force Instagram to expose an HDR rendition.
 
 ### Plugin options
 

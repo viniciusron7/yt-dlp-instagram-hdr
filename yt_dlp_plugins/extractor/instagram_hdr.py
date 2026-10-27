@@ -270,6 +270,10 @@ def _is_xhe_aac(fmt: dict[str, Any]) -> bool:
     return str(fmt.get('acodec') or '').lower() == 'mp4a.40.42'
 
 
+def _is_audio_only(fmt: dict[str, Any]) -> bool:
+    return fmt.get('vcodec') == 'none' and fmt.get('acodec') not in {None, 'none'}
+
+
 def _disambiguate_format_ids(formats: list[dict[str, Any]]) -> None:
     counts = {}
     for fmt in formats:
@@ -293,9 +297,8 @@ def _disambiguate_format_ids(formats: list[dict[str, Any]]) -> None:
 def _merge_native_formats(
         info: dict[str, Any], native_info: dict[str, Any],
         include_xhe_aac: bool = False) -> list[str]:
-    # Merge HDR with the ordinary formats parsed locally from the same response.
-    # Items missing from the ordinary result keep their HDR/audio formats.
-    # xHE-AAC stays only when enabled or when it is the only audio.
+    # Merge locally parsed formats, including complementary API responses.
+    # A progressive file cannot replace an audio-only track for bv+ba.
     native_by_id = {
         str(entry['id']): entry
         for entry in _media_entries(native_info) if entry.get('id') is not None
@@ -307,18 +310,37 @@ def _merge_native_formats(
         native_formats = [dict(fmt) for fmt in traverse_obj(
             native_by_id, (str(entry.get('id')), 'formats', ..., {dict}))]
         if native_formats:
-            _disambiguate_format_ids(native_formats)
-            entry['formats'] = [
-                *(fmt for fmt in entry.get('formats') or []
-                  if str(fmt.get('format_id')).startswith('hdr-') or _is_xhe_aac(fmt)),
-                *native_formats,
-            ]
+            formats = list(entry.get('formats') or [])
+            urls = {fmt['url'] for fmt in formats if fmt.get('url')}
+            for fmt in native_formats:
+                if fmt.get('url') and fmt['url'] in urls:
+                    continue
+                formats.append(fmt)
+                if fmt.get('url'):
+                    urls.add(fmt['url'])
+            entry['formats'] = formats
+            native_entry = native_by_id[str(entry.get('id'))]
+            if native_entry.get('_instagram_hdr') and not entry.get('_instagram_hdr'):
+                entry.update({key: native_entry[key] for key in (
+                    '_instagram_hdr', '_instagram_hdr_verify', '_instagram_hdr_hevc',
+                    '_format_sort_fields') if key in native_entry})
         else:
             missing.append(str(entry.get('id')))
         formats = entry.get('formats') or []
+        # Quality ranks must cover the combined HDR ladder, not each response's
+        # ladder independently (a lower resolution may have a higher local rank).
+        hdr_formats = sorted(
+            (fmt for fmt in formats if fmt.get('dynamic_range') not in {None, 'SDR'}),
+            key=lambda fmt: (
+                (fmt.get('width') or 0) * (fmt.get('height') or 0),
+                fmt.get('vbr') or fmt.get('tbr') or 0,
+                fmt.get('fps') or 0))
+        for quality, fmt in enumerate(hdr_formats):
+            fmt['quality'] = quality
         if not include_xhe_aac and any(
-                fmt.get('acodec') != 'none' and not _is_xhe_aac(fmt) for fmt in formats):
+                _is_audio_only(fmt) and not _is_xhe_aac(fmt) for fmt in formats):
             entry['formats'] = [fmt for fmt in formats if not _is_xhe_aac(fmt)]
+        _disambiguate_format_ids(entry.get('formats') or [])
     return missing
 
 
@@ -342,26 +364,75 @@ class _InstagramSessionError(ExtractorError):
 class _InstagramHDRMixin:
     @property
     def _app_id(self):
-        return self._APP_IDS[self._api_mode()]
+        mode = self._api_mode()
+        return self._APP_IDS['web' if mode == 'auto' else mode]
 
     def _api_mode(self):
         values = self._plugin_configuration_arg('api')
-        mode = values[-1] if values else 'web'
-        if mode not in {'web', 'ios'}:
-            raise ExtractorError('instagramhdr:api must be web or ios', expected=True)
+        mode = values[-1] if values else 'auto'
+        if mode not in {'auto', 'web', 'ios'}:
+            raise ExtractorError('instagramhdr:api must be auto, web or ios', expected=True)
         return mode
 
     @property
     def _api_headers(self):
-        headers = dict(super()._api_headers)
-        if self._api_mode() == 'ios':
-            # Kept as an explicit compatibility option; never fabricate device IDs,
-            # bandwidth, telemetry or a fresh mobile session for browser cookies.
+        mode = self._api_mode()
+        return self._api_headers_for('web' if mode == 'auto' else mode)
+
+    def _api_headers_for(self, mode):
+        headers = {**super()._api_headers, 'X-IG-App-ID': self._APP_IDS[mode]}
+        if mode == 'ios':
+            # Never fabricate device IDs, bandwidth, telemetry or a fresh session.
             headers['User-Agent'] = _IOS_USER_AGENT
             headers['X-IG-Capabilities'] = '36r/F/8='
         if csrf := self._get_cookies(self._BASE_URL).get('csrftoken'):
             headers['X-CSRFToken'] = csrf.value
         return headers
+
+    def _download_media_info(self, media_id, display_id, *, mode=None, fatal=True,
+                             note='Downloading video info'):
+        mode = mode or self._api_mode()
+        mode = 'web' if mode == 'auto' else mode
+        host = 'www.instagram.com' if mode == 'web' else 'i.instagram.com'
+        return traverse_obj(self._download_json(
+            f'https://{host}/api/v1/media/{media_id}/info/', display_id,
+            note, 'Video info extraction failed', fatal=fatal,
+            impersonate=self._can_impersonate and mode == 'web',
+            headers=self._api_headers_for(mode)), ('items', 0, {dict}))
+
+    def _enrich_formats(self, result, media_id, display_id):
+        entries = [entry for entry in _media_entries(result) if any(
+            fmt.get('vcodec') != 'none' for fmt in entry.get('formats') or [])]
+        mode = self._api_mode()
+        include_xhe_aac = self._plugin_flag('include_xhe_aac')
+        if mode == 'auto' and any(
+                not entry.get('_instagram_hdr') or not any(
+                    _is_audio_only(fmt) for fmt in entry.get('formats') or [])
+                for entry in entries):
+            alternate = 'ios'
+            note = 'Checking iOS media info for HDR and audio formats'
+        elif mode == 'ios' and any(not any(
+                _is_audio_only(fmt) and (include_xhe_aac or not _is_xhe_aac(fmt))
+                for fmt in entry.get('formats') or []) for entry in entries):
+            alternate = 'web'
+            note = 'Checking web media info for compatible audio'
+        else:
+            return result
+
+        # Only supplement successful responses. Access rejections still stop the
+        # run; no other client is tried after a rejected request.
+        item = self._download_media_info(
+            media_id, display_id, mode=alternate, fatal=False, note=note)
+        if not item:
+            return result
+        ids = {entry.get('id') for entry in entries}
+        media_items = traverse_obj(item, ('carousel_media', ..., {dict})) or [item]
+        supplemental = {'_type': 'playlist', 'entries': [
+            _InstagramHDRMixin._extract_product_media(self, media)
+            for media in media_items if traverse_obj(media, ('pk', {_pk_to_id})) in ids
+        ]}
+        _merge_native_formats(result, supplemental, include_xhe_aac)
+        return result
 
     @property
     def _access_state(self):
@@ -480,8 +551,8 @@ class _InstagramHDRMixin:
             return
         if self._api_mode() == 'ios':
             self.report_warning(
-                'The optional iOS API uses a mobile client with browser cookies and can '
-                'put the account at risk. Prefer the default instagramhdr:api=web mode',
+                'The iOS API uses a mobile client with browser cookies and can '
+                'put the account at risk. Use instagramhdr:api=web to use only the web API',
                 only_once=True)
         # Added once per YoutubeDL (later calls are no-ops); each item carries its own options.
         # The HEVC conversion runs after -x but before the steps that act on the final file,
@@ -548,8 +619,8 @@ class _InstagramHDRMixin:
             key=lambda track: track['bandwidth_int'],
         )
         # Read progressive formats and metadata with yt-dlp's parser, then add all
-        # DASH tracks locally. No second API call or client switch is needed. Our
-        # manifest parser also tolerates Instagram's unescaped ampersands.
+        # DASH tracks locally. Our manifest parser also tolerates Instagram's
+        # unescaped ampersands.
         native = InstagramBaseIE._extract_product_media(
             self, {**product_media, 'video_dash_manifest': ''})
         native['formats'] = [
@@ -564,7 +635,8 @@ class _InstagramHDRMixin:
         _merge_native_formats(result, native, include_xhe_aac)
         _disambiguate_format_ids(result['formats'])
         if not videos:
-            self.to_screen('No VP9/AV1 10-bit HDR representation found; using available SDR formats')
+            self.to_screen(
+                'No VP9/AV1 10-bit HDR representation in this media response; keeping available SDR formats')
             return result
 
         best_video = videos[-1]
@@ -606,14 +678,11 @@ class InstagramHDRIE(_InstagramHDRMixin, InstagramIE):
         # Keep the session intact if a request is rejected. The native extractor
         # clears sessionid on login redirects and continues with more requests.
         video_id = self._match_id(url)
-        item = traverse_obj(self._download_json(
-            f'{self._API_BASE_URL}/media/{_id_to_pk(video_id)}/info/', video_id,
-            'Downloading video info', 'Video info extraction failed',
-            impersonate=self._can_impersonate and self._is_web_app,
-            headers=self._api_headers), ('items', 0, {dict}))
+        media_id = _id_to_pk(video_id)
+        item = self._download_media_info(media_id, video_id)
         if not item:
             raise ExtractorError('Instagram returned no media item')
-        return self._extract_product(item)
+        return self._enrich_formats(self._extract_product(item), media_id, video_id)
 
 
 class InstagramHDRStoryIE(_InstagramHDRMixin, InstagramStoryIE):
@@ -678,13 +747,14 @@ class InstagramHDRStoryIE(_InstagramHDRMixin, InstagramStoryIE):
 
         media_id = str(product_media.get('pk') or '')
         tray_manifest = traverse_obj(product_media, ('video_dash_manifest', {str})) or ''
+        result = super()._extract_product_media(product_media)
         if not media_id or any(track['hdr_kind'] for track in _parse_manifest(tray_manifest)):
-            return super()._extract_product_media(product_media)
+            return self._enrich_formats(result, media_id, media_id) if media_id else result
         # The tray may omit HDR even when it includes SDR DASH. Enrich only items
         # without an HDR manifest, using the same client and access protections.
-        detailed_media = traverse_obj(self._download_json(
-            f'{self._API_BASE_URL}/media/{media_id}/info/', media_id,
-            'Downloading HDR story info', 'HDR story info extraction failed',
-            impersonate=self._can_impersonate and self._is_web_app,
-            headers=self._api_headers, fatal=False), ('items', 0, {dict}))
-        return super()._extract_product_media({**product_media, **(detailed_media or {})})
+        detailed_media = self._download_media_info(
+            media_id, media_id, note='Downloading HDR story info', fatal=False)
+        if detailed_media:
+            detailed_result = super()._extract_product_media({**product_media, **detailed_media})
+            _merge_native_formats(result, detailed_result, self._plugin_flag('include_xhe_aac'))
+        return self._enrich_formats(result, media_id, media_id)
